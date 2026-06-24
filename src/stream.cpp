@@ -6,6 +6,7 @@
 // standard includes
 #include <fstream>
 #include <future>
+#include <limits>
 #include <queue>
 
 // lib includes
@@ -49,6 +50,7 @@ constexpr int IDX_RUMBLE_TRIGGER_DATA = 12;
 constexpr int IDX_SET_MOTION_EVENT = 13;
 constexpr int IDX_SET_RGB_LED = 14;
 constexpr int IDX_SET_ADAPTIVE_TRIGGERS = 15;
+constexpr int IDX_NATIVE_CURSOR = 16;
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -67,6 +69,7 @@ static const short packetTypes[] = {
   0x5501,  // Set motion event (Sunshine protocol extension)
   0x5502,  // Set RGB LED (Sunshine protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
+  0x5504,  // Native cursor update (Sunshine protocol extension)
 };
 
 namespace asio = boost::asio;
@@ -210,6 +213,22 @@ namespace stream {
 
     // Sunshine protocol extension
     SS_HDR_METADATA metadata;
+  };
+
+  struct control_native_cursor_t {
+    control_header_v2 header;
+
+    std::uint8_t flags;
+    std::uint8_t format;
+    std::uint16_t reserved;
+    boost::endian::little_uint32_at x;
+    boost::endian::little_uint32_at y;
+    boost::endian::little_uint16_at width;
+    boost::endian::little_uint16_at height;
+    boost::endian::little_uint16_at hotspotX;
+    boost::endian::little_uint16_at hotspotY;
+    boost::endian::little_uint32_at shapeId;
+    boost::endian::little_uint32_at imageSize;
   };
 
   typedef struct control_encrypted_t {
@@ -402,6 +421,15 @@ namespace stream {
 
       platf::feedback_queue_t feedback_queue;
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;
+
+      bool native_cursor_visible {};
+      bool native_cursor_sent {};
+      std::uint32_t native_cursor_shape_id {};
+      std::uintptr_t native_cursor_handle_id {};
+      std::uint16_t native_cursor_width {};
+      std::uint16_t native_cursor_height {};
+      std::uint16_t native_cursor_hotspot_x {};
+      std::uint16_t native_cursor_hotspot_y {};
     } control;
 
     std::uint32_t launch_session_id;
@@ -450,6 +478,43 @@ namespace stream {
       // Nvidia's old style encryption uses a 16-byte IV
       iv.resize(16);
 
+      iv[0] = (std::uint8_t) seq;
+    }
+
+    auto packet = (control_encrypted_p) tagged_cipher.data();
+
+    auto bytes = session->control.cipher.encrypt(plaintext, packet->payload(), &iv);
+    if (bytes <= 0) {
+      BOOST_LOG(error) << "Couldn't encrypt control data"sv;
+      return {};
+    }
+
+    std::uint16_t packet_length = bytes + crypto::cipher::tag_size + sizeof(control_encrypted_t::seq);
+
+    packet->encryptedHeaderType = util::endian::little(0x0001);
+    packet->length = util::endian::little(packet_length);
+    packet->seq = util::endian::little(seq);
+
+    return std::string_view {(char *) tagged_cipher.data(), packet_length + sizeof(control_encrypted_t) - sizeof(control_encrypted_t::seq)};
+  }
+
+  static inline std::string_view encode_control(session_t *session, const std::string_view &plaintext, std::vector<std::uint8_t> &tagged_cipher) {
+    if (session->config.controlProtocolType != 13) {
+      return plaintext;
+    }
+
+    tagged_cipher.resize(sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(plaintext.size()) + crypto::cipher::tag_size);
+
+    auto seq = session->control.seq++;
+
+    auto &iv = session->control.outgoing_iv;
+    if (session->config.encryptionFlagsEnabled & SS_ENC_CONTROL_V2) {
+      iv.resize(12);
+      std::copy_n((uint8_t *) &seq, sizeof(seq), std::begin(iv));
+      iv[10] = 'H';
+      iv[11] = 'C';
+    } else {
+      iv.resize(16);
       iv[0] = (std::uint8_t) seq;
     }
 
@@ -920,6 +985,90 @@ namespace stream {
     return 0;
   }
 
+  int send_native_cursor(session_t *session, const platf::cursor_info_t &cursor_probe) {
+    if (!session->control.peer || !session->config.nativeCursor) {
+      return 0;
+    }
+
+    constexpr std::uint8_t CURSOR_FLAG_VISIBLE = 0x01;
+    constexpr std::uint8_t CURSOR_FLAG_SHAPE = 0x02;
+    constexpr std::uint8_t CURSOR_FORMAT_BGRA = 0x01;
+
+    const bool shape_changed = cursor_probe.visible &&
+                               (!session->control.native_cursor_sent ||
+                                session->control.native_cursor_handle_id != cursor_probe.handle_id ||
+                                session->control.native_cursor_width != cursor_probe.width ||
+                                session->control.native_cursor_height != cursor_probe.height ||
+                                session->control.native_cursor_hotspot_x != cursor_probe.hotspot_x ||
+                                session->control.native_cursor_hotspot_y != cursor_probe.hotspot_y);
+    const bool state_changed = !session->control.native_cursor_sent ||
+                               session->control.native_cursor_visible != cursor_probe.visible ||
+                               shape_changed;
+
+    if (!state_changed) {
+      return 0;
+    }
+
+    platf::cursor_info_t cursor = cursor_probe;
+    if (shape_changed) {
+      auto cursor_shape = platf::capture_native_cursor_shape(cursor_probe);
+      if (!cursor_shape) {
+        return -1;
+      }
+
+      cursor = std::move(*cursor_shape);
+    }
+
+    const std::uint32_t image_size = shape_changed ? static_cast<std::uint32_t>(cursor.bgra.size()) : 0;
+    if (image_size > std::numeric_limits<std::uint16_t>::max() - sizeof(control_native_cursor_t)) {
+      BOOST_LOG(debug) << "Skipping oversized native cursor image ["sv << image_size << " bytes]"sv;
+      return -1;
+    }
+
+    std::vector<std::uint8_t> plaintext(sizeof(control_native_cursor_t) + image_size);
+    auto packet = (control_native_cursor_t *) plaintext.data();
+    packet->header.type = packetTypes[IDX_NATIVE_CURSOR];
+    packet->header.payloadLength = static_cast<std::uint16_t>(plaintext.size() - sizeof(control_header_v2));
+    packet->flags = (cursor.visible ? CURSOR_FLAG_VISIBLE : 0) | (shape_changed ? CURSOR_FLAG_SHAPE : 0);
+    packet->format = CURSOR_FORMAT_BGRA;
+    packet->reserved = 0;
+    packet->x = static_cast<std::uint32_t>(cursor.x);
+    packet->y = static_cast<std::uint32_t>(cursor.y);
+    packet->width = shape_changed ? cursor.width : 0;
+    packet->height = shape_changed ? cursor.height : 0;
+    packet->hotspotX = shape_changed ? cursor.hotspot_x : 0;
+    packet->hotspotY = shape_changed ? cursor.hotspot_y : 0;
+    packet->shapeId = cursor.visible ? cursor.shape_id : 0;
+    packet->imageSize = image_size;
+
+    if (image_size) {
+      std::copy(cursor.bgra.begin(), cursor.bgra.end(), (std::uint8_t *) (packet + 1));
+    }
+
+    std::vector<std::uint8_t> encrypted_payload;
+    auto payload = encode_control(session, {(char *) plaintext.data(), plaintext.size()}, encrypted_payload);
+    if (payload.empty()) {
+      return -1;
+    }
+
+    if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+      TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
+      BOOST_LOG(warning) << "Couldn't send native cursor to ["sv << addr << ':' << port << ']';
+
+      return -1;
+    }
+
+    session->control.native_cursor_sent = true;
+    session->control.native_cursor_visible = cursor.visible;
+    session->control.native_cursor_shape_id = cursor.visible ? cursor.shape_id : 0;
+    session->control.native_cursor_handle_id = cursor.visible ? cursor.handle_id : 0;
+    session->control.native_cursor_width = cursor.visible ? cursor.width : 0;
+    session->control.native_cursor_height = cursor.visible ? cursor.height : 0;
+    session->control.native_cursor_hotspot_x = cursor.visible ? cursor.hotspot_x : 0;
+    session->control.native_cursor_hotspot_y = cursor.visible ? cursor.hotspot_y : 0;
+    return 0;
+  }
+
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
@@ -1071,6 +1220,8 @@ namespace stream {
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
       bool has_session_awaiting_peer = false;
+      bool has_native_cursor_session = false;
+      std::optional<platf::cursor_info_t> native_cursor;
 
       {
         auto lg = server->_sessions.lock();
@@ -1126,6 +1277,16 @@ namespace stream {
 
               send_hdr_mode(session, std::move(hdr_info));
             }
+
+            if (session->config.nativeCursor) {
+              has_native_cursor_session = true;
+              if (!native_cursor) {
+                native_cursor = platf::probe_native_cursor();
+              }
+              if (native_cursor) {
+                send_native_cursor(session, *native_cursor);
+              }
+            }
           }
 
           ++pos;
@@ -1138,7 +1299,7 @@ namespace stream {
         break;
       }
 
-      server->iterate(150ms);
+      server->iterate(has_native_cursor_session ? 16ms : 150ms);
     }
 
     // Let all remaining connections know the server is shutting down

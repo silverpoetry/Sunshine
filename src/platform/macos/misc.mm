@@ -38,6 +38,18 @@ namespace bp = boost::process::v1;
 
 namespace platf {
 
+  bool native_cursor_supported() {
+    return false;
+  }
+
+  std::optional<cursor_info_t> probe_native_cursor() {
+    return std::nullopt;
+  }
+
+  std::optional<cursor_info_t> capture_native_cursor_shape(const cursor_info_t &cursor) {
+    return std::nullopt;
+  }
+
 // Even though the following two functions are available starting in macOS 10.15, they weren't
 // actually in the Mac SDK until Xcode 12.2, the first to include the SDK for macOS 11
 #if __MAC_OS_X_VERSION_MAX_ALLOWED < 110000  // __MAC_11_0

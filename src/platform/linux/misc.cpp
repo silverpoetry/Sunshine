@@ -124,6 +124,18 @@ namespace dyn {
 namespace platf {
   using ifaddr_t = util::safe_ptr<ifaddrs, freeifaddrs>;
 
+  bool native_cursor_supported() {
+    return false;
+  }
+
+  std::optional<cursor_info_t> probe_native_cursor() {
+    return std::nullopt;
+  }
+
+  std::optional<cursor_info_t> capture_native_cursor_shape(const cursor_info_t &cursor) {
+    return std::nullopt;
+  }
+
   ifaddr_t get_ifaddrs() {
     ifaddrs *p {nullptr};
 

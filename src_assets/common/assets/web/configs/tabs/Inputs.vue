@@ -181,6 +181,15 @@ const config = ref(props.config)
               v-model="config.native_pen_touch"
               default="true"
     ></Checkbox>
+
+    <!-- Native cursor support -->
+    <Checkbox v-if="config.mouse === 'enabled' && platform === 'windows'"
+              class="mb-3"
+              id="native_cursor"
+              locale-prefix="config"
+              v-model="config.native_cursor"
+              default="false"
+    ></Checkbox>
   </div>
 </template>
 

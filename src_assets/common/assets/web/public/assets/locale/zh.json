@@ -292,6 +292,8 @@
     "motion_as_ds4_desc": "如果禁用，则在选择游戏手柄类型时不会考虑陀螺仪的存在。",
     "mouse": "启用鼠标输入",
     "mouse_desc": "允许访客使用鼠标控制主机系统",
+    "native_cursor": "原生光标串流",
+    "native_cursor_desc": "启用后，Sunshine 可以向明确支持该扩展的客户端单独发送光标形状更新。旧客户端仍然会在视频流中看到光标。",
     "native_pen_touch": "原生笔/触摸支持",
     "native_pen_touch_desc": "启用后，Sunshine 将透传来自 Moonlight 客户端的原生笔/触控事件。对于不支持原生笔/触控的旧版应用程序来说，禁用此功能非常有用。",
     "notify_pre_releases": "预发布通知",

@@ -688,6 +688,32 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### native_cursor
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            When enabled, Sunshine can send cursor shape updates separately from the video stream to clients that
+            explicitly negotiate support for the Sunshine native cursor extension.
+            <br>
+            Clients that do not negotiate this extension continue to receive the cursor in the video stream.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            native_cursor = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### keybindings
 
 <table>

@@ -292,6 +292,8 @@
     "motion_as_ds4_desc": "If disabled, motion sensors will not be taken into account during gamepad type selection.",
     "mouse": "Enable Mouse Input",
     "mouse_desc": "Allows guests to control the host system with the mouse",
+    "native_cursor": "Native Cursor Streaming",
+    "native_cursor_desc": "When enabled, Sunshine can send cursor shape updates separately to clients that explicitly support this Sunshine extension. Older clients keep receiving the cursor in the video stream.",
     "native_pen_touch": "Native Pen/Touch Support",
     "native_pen_touch_desc": "When enabled, Sunshine will pass through native pen/touch events from Moonlight clients. This can be useful to disable for older applications without native pen/touch support.",
     "notify_pre_releases": "PreRelease Notifications",

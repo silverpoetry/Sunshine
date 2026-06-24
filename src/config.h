@@ -224,6 +224,7 @@ namespace config {
 
     bool high_resolution_scrolling;
     bool native_pen_touch;
+    bool native_cursor;
   };
 
   namespace flag {

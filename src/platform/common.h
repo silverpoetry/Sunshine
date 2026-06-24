@@ -9,7 +9,9 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <vector>
 
 // lib includes
 #include <boost/core/noncopyable.hpp>
@@ -286,6 +288,23 @@ namespace platf {
     constexpr caps_t pen_touch = 0x01;  // Pen and touch events
     constexpr caps_t controller_touch = 0x02;  // Controller touch events
   };  // namespace platform_caps
+
+  struct cursor_info_t {
+    bool visible {};
+    std::uint32_t shape_id {};
+    std::uintptr_t handle_id {};
+    std::int32_t x {};
+    std::int32_t y {};
+    std::uint16_t width {};
+    std::uint16_t height {};
+    std::uint16_t hotspot_x {};
+    std::uint16_t hotspot_y {};
+    std::vector<std::uint8_t> bgra;
+  };
+
+  bool native_cursor_supported();
+  std::optional<cursor_info_t> probe_native_cursor();
+  std::optional<cursor_info_t> capture_native_cursor_shape(const cursor_info_t &cursor);
 
   struct gamepad_state_t {
     std::uint32_t buttonFlags;

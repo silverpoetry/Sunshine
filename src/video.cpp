@@ -5,6 +5,7 @@
 // standard includes
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <bitset>
 #include <list>
 #include <thread>
@@ -1200,6 +1201,21 @@ namespace video {
     }
   }
 
+  template<class SessionCollection>
+  bool should_capture_cursor(const SessionCollection &sessions) {
+    if (!display_cursor) {
+      return false;
+    }
+
+    return std::ranges::any_of(sessions, [](const auto &session) {
+      if constexpr (requires { session.config.nativeCursor; }) {
+        return !session.config.nativeCursor;
+      } else {
+        return !session->config.nativeCursor;
+      }
+    });
+  }
+
   /**
    * @brief Update the list of display names before or during a stream.
    * @details This will attempt to keep `current_display_index` pointing at the same display.
@@ -1395,6 +1411,7 @@ namespace video {
     platf::set_thread_name("video::capture");
     platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
+    bool capture_cursor = should_capture_cursor(capture_ctxs);
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
@@ -1421,6 +1438,8 @@ namespace video {
           capture_ctxs.emplace_back(std::move(*capture_ctx_queue->pop()));
         }
 
+        capture_cursor = should_capture_cursor(capture_ctxs);
+
         if (switch_display_event->peek()) {
           artificial_reinit = true;
           return false;
@@ -1429,7 +1448,7 @@ namespace video {
         return true;
       };
 
-      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
+      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &capture_cursor);
 
       if (artificial_reinit && status != platf::capture_e::error) {
         status = platf::capture_e::reinit;
@@ -2331,6 +2350,7 @@ namespace video {
     }
 
     auto ec = platf::capture_e::ok;
+    bool capture_cursor = should_capture_cursor(synced_session_ctxs);
     while (encode_session_ctx_queue.running()) {
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
         while (encode_session_ctx_queue.peek()) {
@@ -2349,6 +2369,8 @@ namespace video {
 
           synced_sessions.emplace_back(std::move(*encode_session));
         }
+
+        capture_cursor = should_capture_cursor(synced_session_ctxs);
 
         KITTY_WHILE_LOOP(auto pos = std::begin(synced_sessions), pos != std::end(synced_sessions), {
           auto ctx = pos->ctx;
@@ -2411,7 +2433,7 @@ namespace video {
         return true;
       };
 
-      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
+      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &capture_cursor);
       switch (status) {
         case platf::capture_e::reinit:
         case platf::capture_e::error:

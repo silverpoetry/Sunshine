@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <csignal>
+#include <cstring>
 #include <filesystem>
 #include <iomanip>
 #include <iterator>
@@ -102,6 +103,33 @@ using namespace std::literals;
 namespace platf {
   using adapteraddrs_t = util::c_ptr<IP_ADAPTER_ADDRESSES>;
 
+  namespace {
+    std::uint32_t fnv1a32(std::string_view bytes) {
+      std::uint32_t hash = 2166136261u;
+      for (unsigned char byte : bytes) {
+        hash ^= byte;
+        hash *= 16777619u;
+      }
+      return hash;
+    }
+
+    int bitmap_width(HBITMAP bitmap) {
+      BITMAP bm {};
+      if (!bitmap || GetObjectW(bitmap, sizeof(bm), &bm) != sizeof(bm)) {
+        return 0;
+      }
+      return bm.bmWidth;
+    }
+
+    int bitmap_height(HBITMAP bitmap) {
+      BITMAP bm {};
+      if (!bitmap || GetObjectW(bitmap, sizeof(bm), &bm) != sizeof(bm)) {
+        return 0;
+      }
+      return bm.bmHeight;
+    }
+  }  // namespace
+
   bool enabled_mouse_keys = false;
   MOUSEKEYS previous_mouse_keys_state;
 
@@ -118,6 +146,141 @@ namespace platf {
   decltype(WlanFreeMemory) *fn_WlanFreeMemory = nullptr;
   decltype(WlanEnumInterfaces) *fn_WlanEnumInterfaces = nullptr;
   decltype(WlanSetInterface) *fn_WlanSetInterface = nullptr;
+
+  bool native_cursor_supported() {
+    return true;
+  }
+
+  std::optional<cursor_info_t> probe_native_cursor() {
+    CURSORINFO cursor_info {
+      .cbSize = sizeof(CURSORINFO),
+    };
+    if (!GetCursorInfo(&cursor_info)) {
+      BOOST_LOG(debug) << "GetCursorInfo() failed: "sv << GetLastError();
+      return std::nullopt;
+    }
+
+    cursor_info_t result {};
+    result.visible = (cursor_info.flags & CURSOR_SHOWING) != 0 && cursor_info.hCursor;
+    result.x = cursor_info.ptScreenPos.x;
+    result.y = cursor_info.ptScreenPos.y;
+
+    if (!result.visible) {
+      return result;
+    }
+
+    result.handle_id = reinterpret_cast<std::uintptr_t>(cursor_info.hCursor);
+
+    ICONINFO icon_info {};
+    if (!GetIconInfo(cursor_info.hCursor, &icon_info)) {
+      BOOST_LOG(debug) << "GetIconInfo() failed: "sv << GetLastError();
+      return std::nullopt;
+    }
+
+    auto icon_cleanup = util::fail_guard([&]() {
+      if (icon_info.hbmColor) {
+        DeleteObject(icon_info.hbmColor);
+      }
+      if (icon_info.hbmMask) {
+        DeleteObject(icon_info.hbmMask);
+      }
+    });
+
+    int width = bitmap_width(icon_info.hbmColor);
+    int height = bitmap_height(icon_info.hbmColor);
+    if (width <= 0 || height <= 0) {
+      width = bitmap_width(icon_info.hbmMask);
+      height = bitmap_height(icon_info.hbmMask) / 2;
+    }
+
+    constexpr int max_cursor_dimension = 96;
+    if (width <= 0 || height <= 0 || width > max_cursor_dimension || height > max_cursor_dimension) {
+      BOOST_LOG(debug) << "Ignoring unsupported cursor dimensions "sv << width << 'x' << height;
+      return std::nullopt;
+    }
+
+    result.width = static_cast<std::uint16_t>(width);
+    result.height = static_cast<std::uint16_t>(height);
+    result.hotspot_x = static_cast<std::uint16_t>(icon_info.xHotspot);
+    result.hotspot_y = static_cast<std::uint16_t>(icon_info.yHotspot);
+
+    return result;
+  }
+
+  std::optional<cursor_info_t> capture_native_cursor_shape(const cursor_info_t &cursor) {
+    if (!cursor.visible || !cursor.handle_id) {
+      return cursor;
+    }
+
+    auto cursor_handle = reinterpret_cast<HCURSOR>(cursor.handle_id);
+    const auto width = static_cast<int>(cursor.width);
+    const auto height = static_cast<int>(cursor.height);
+
+    cursor_info_t result = cursor;
+    result.bgra.resize(static_cast<std::size_t>(width) * height * 4);
+
+    BITMAPINFO bmi {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void *pixels = nullptr;
+    auto dib = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!dib || !pixels) {
+      BOOST_LOG(debug) << "CreateDIBSection() failed: "sv << GetLastError();
+      if (dib) {
+        DeleteObject(dib);
+      }
+      return std::nullopt;
+    }
+
+    auto dib_cleanup = util::fail_guard([&]() {
+      DeleteObject(dib);
+    });
+
+    HDC screen_dc = GetDC(nullptr);
+    HDC mem_dc = CreateCompatibleDC(screen_dc);
+    ReleaseDC(nullptr, screen_dc);
+    if (!mem_dc) {
+      BOOST_LOG(debug) << "CreateCompatibleDC() failed: "sv << GetLastError();
+      return std::nullopt;
+    }
+
+    auto dc_cleanup = util::fail_guard([&]() {
+      DeleteDC(mem_dc);
+    });
+
+    auto old_bitmap = SelectObject(mem_dc, dib);
+    RECT rect {
+      .left = 0,
+      .top = 0,
+      .right = width,
+      .bottom = height,
+    };
+    FillRect(mem_dc, &rect, (HBRUSH) GetStockObject(BLACK_BRUSH));
+
+    if (!DrawIconEx(mem_dc, 0, 0, cursor_handle, width, height, 0, nullptr, DI_NORMAL)) {
+      BOOST_LOG(debug) << "DrawIconEx() failed: "sv << GetLastError();
+      SelectObject(mem_dc, old_bitmap);
+      return std::nullopt;
+    }
+
+    GdiFlush();
+    std::memcpy(result.bgra.data(), pixels, result.bgra.size());
+    SelectObject(mem_dc, old_bitmap);
+
+    auto hash = fnv1a32({(char *) result.bgra.data(), result.bgra.size()});
+    hash ^= result.width + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+    hash ^= result.height + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+    hash ^= result.hotspot_x + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+    hash ^= result.hotspot_y + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+    result.shape_id = hash ? hash : 1;
+
+    return result;
+  }
 
   std::filesystem::path appdata() {
     WCHAR sunshine_path[MAX_PATH];
