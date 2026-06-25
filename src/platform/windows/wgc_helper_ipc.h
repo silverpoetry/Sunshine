@@ -22,6 +22,7 @@ namespace platf::dxgi::wgc_helper {
     error = 5,
     frame_request = 6,
     frame_release = 7,
+    no_frame = 8,
   };
 
   enum class error_code: std::uint32_t {
@@ -57,6 +58,11 @@ namespace platf::dxgi::wgc_helper {
   struct cursor_message {
     message_header header;
     bool cursor_visible;
+  };
+
+  struct frame_request_message {
+    message_header header;
+    std::uint32_t timeout_ms;
   };
 
   struct frame_message {

@@ -3,6 +3,7 @@
  * @brief Definitions for WinRT Windows.Graphics.Capture API
  */
 // standard includes
+#include <algorithm>
 #include <thread>
 #include <vector>
 
@@ -657,15 +658,14 @@ namespace platf::dxgi {
       return capture_e::error;
     }
 
-    helper_ipc::message_header request = helper_ipc::make_header(helper_ipc::message_type::frame_request, sizeof(request));
+    helper_ipc::frame_request_message request {};
+    request.header = helper_ipc::make_header(helper_ipc::message_type::frame_request, sizeof(request));
+    request.timeout_ms = timeout <= 0ms ? 0u : static_cast<std::uint32_t>(std::min<std::int64_t>(timeout.count(), 1000));
     if (!write_exact(helper_pipe, &request, sizeof(request))) {
       return capture_e::error;
     }
 
-    auto wait_time = timeout <= 0ms ? 25ms : timeout;
-    if (wait_time > 25ms) {
-      wait_time = 25ms;
-    }
+    auto wait_time = std::chrono::milliseconds(request.timeout_ms) + 10ms;
 
     helper_ipc::message_header header {};
     switch (read_exact_timeout(helper_pipe, &header, sizeof(header), wait_time)) {
@@ -675,6 +675,10 @@ namespace platf::dxgi {
         return capture_e::timeout;
       case pipe_read_e::error:
         return capture_e::error;
+    }
+
+    if (header.type == helper_ipc::message_type::no_frame && header.size == sizeof(helper_ipc::message_header)) {
+      return capture_e::timeout;
     }
 
     if (header.type == helper_ipc::message_type::error) {

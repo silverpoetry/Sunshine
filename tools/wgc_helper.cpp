@@ -155,6 +155,11 @@ namespace {
     return static_cast<int>(code);
   }
 
+  bool send_no_frame(HANDLE pipe) {
+    auto message = ipc::make_header(ipc::message_type::no_frame, sizeof(ipc::message_header));
+    return write_exact(pipe, &message, sizeof(message));
+  }
+
   bool make_device(com_ptr<ID3D11Device> &device, com_ptr<ID3D11DeviceContext> &context) {
     D3D_FEATURE_LEVEL feature_levels[] {
       D3D_FEATURE_LEVEL_11_1,
@@ -574,7 +579,7 @@ namespace {
       }
     }
 
-    bool send_requested_frame(HANDLE pipe) {
+    bool send_requested_frame(HANDLE pipe, std::chrono::milliseconds timeout) {
       int slot_index = -1;
       ipc::frame_message message {};
 
@@ -590,14 +595,16 @@ namespace {
             slots[latest_slot].writing ||
             slots[latest_slot].in_flight ||
             !slots[latest_slot].mutex) {
-          state_cv.wait_for(lock, 2ms, [&]() {
-            return fatal_error ||
-                   (latest_slot >= 0 &&
-                    slots[latest_slot].ready &&
-                    !slots[latest_slot].writing &&
-                    !slots[latest_slot].in_flight &&
-                    slots[latest_slot].mutex);
-          });
+          if (timeout > 0ms) {
+            state_cv.wait_for(lock, timeout, [&]() {
+              return fatal_error ||
+                     (latest_slot >= 0 &&
+                      slots[latest_slot].ready &&
+                      !slots[latest_slot].writing &&
+                      !slots[latest_slot].in_flight &&
+                      slots[latest_slot].mutex);
+            });
+          }
         }
 
         if (fatal_error) {
@@ -609,7 +616,8 @@ namespace {
             slots[latest_slot].writing ||
             slots[latest_slot].in_flight ||
             !slots[latest_slot].mutex) {
-          return true;
+          lock.unlock();
+          return send_no_frame(pipe);
         }
 
         slot_index = latest_slot;
@@ -621,7 +629,8 @@ namespace {
 
         const HRESULT acquire_status = slot.mutex->AcquireSync(0, 0);
         if (mutex_timeout(acquire_status)) {
-          return true;
+          lock.unlock();
+          return send_no_frame(pipe);
         }
         if (FAILED(acquire_status)) {
           send_error(pipe, ipc::error_code::shared_texture, detail_code(0xB1, acquire_status));
@@ -634,6 +643,7 @@ namespace {
           return false;
         }
         slot.in_flight = true;
+        slot.ready = false;
 
         message.header = ipc::make_header(ipc::message_type::frame, sizeof(message));
         message.shared_handle = reinterpret_cast<std::uint64_t>(slot.shared_handle.get());
@@ -680,9 +690,15 @@ namespace {
         return 0;
       }
 
-      if (ipc::valid_header(header, ipc::message_type::frame_request, sizeof(header))) {
+      if (ipc::valid_header(header, ipc::message_type::frame_request, sizeof(ipc::frame_request_message))) {
+        ipc::frame_request_message request {};
+        request.header = header;
+        if (!read_exact(pipe.get(), reinterpret_cast<std::uint8_t *>(&request) + sizeof(header), sizeof(request) - sizeof(header))) {
+          session.stop_capture_thread();
+          return ERROR_BROKEN_PIPE;
+        }
         try {
-          if (!session.send_requested_frame(pipe.get())) {
+          if (!session.send_requested_frame(pipe.get(), std::chrono::milliseconds(request.timeout_ms))) {
             Sleep(10);
             session.stop_capture_thread();
             return static_cast<int>(ipc::error_code::generic);
