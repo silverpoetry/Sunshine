@@ -63,6 +63,7 @@ namespace platf::dxgi::wgc_helper {
   struct frame_request_message {
     message_header header;
     std::uint32_t timeout_ms;
+    std::uint64_t request_id;
   };
 
   struct frame_message {
@@ -73,11 +74,24 @@ namespace platf::dxgi::wgc_helper {
     std::uint32_t height;
     DXGI_FORMAT format;
     std::uint64_t qpc_timestamp;
+    std::uint64_t sequence;
+    std::uint64_t helper_send_qpc;
+    std::uint64_t request_id;
+  };
+
+  struct no_frame_message {
+    message_header header;
+    std::uint64_t request_id;
   };
 
   struct frame_release_message {
     message_header header;
     std::uint64_t shared_handle;
+    std::uint64_t sequence;
+    std::uint64_t helper_send_qpc;
+    std::uint64_t main_received_qpc;
+    std::uint64_t main_acquired_qpc;
+    std::uint64_t main_released_qpc;
   };
 
   struct error_message {

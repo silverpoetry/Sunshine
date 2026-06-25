@@ -367,6 +367,11 @@ namespace platf::dxgi {
     bool helper_active {};
     bool helper_cursor_visible {};
     bool helper_frame_locked {};
+    std::uint64_t helper_frame_sequence {};
+    std::uint64_t helper_frame_send_qpc {};
+    std::uint64_t helper_frame_received_qpc {};
+    std::uint64_t helper_frame_acquired_qpc {};
+    std::uint64_t helper_next_request_id {};
 
     void on_frame_arrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender, winrt::Windows::Foundation::IInspectable const &);
     int init_helper(display_base_t *display, const ::video::config_t &config);

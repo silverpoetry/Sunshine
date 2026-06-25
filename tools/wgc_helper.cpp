@@ -5,10 +5,13 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include <d3d11_4.h>
@@ -120,6 +123,72 @@ namespace {
     }
   };
 
+  struct diagnostic_log_t {
+    handle_guard file;
+    std::mutex mutex;
+
+    void open(const wchar_t *path) {
+      std::lock_guard lock {mutex};
+      file.reset(CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    }
+
+    void write(std::string_view message) {
+      std::lock_guard lock {mutex};
+      if (!file) {
+        return;
+      }
+
+      SYSTEMTIME time {};
+      GetLocalTime(&time);
+
+      std::ostringstream line;
+      line << '['
+           << time.wYear << '-'
+           << (time.wMonth < 10 ? "0" : "") << time.wMonth << '-'
+           << (time.wDay < 10 ? "0" : "") << time.wDay << ' '
+           << (time.wHour < 10 ? "0" : "") << time.wHour << ':'
+           << (time.wMinute < 10 ? "0" : "") << time.wMinute << ':'
+           << (time.wSecond < 10 ? "0" : "") << time.wSecond << '.'
+           << time.wMilliseconds
+           << "] " << message << "\r\n";
+
+      const auto text = line.str();
+      DWORD written = 0;
+      WriteFile(file.get(), text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+    }
+  };
+
+  diagnostic_log_t g_log;
+
+  void atomic_max(std::atomic<std::uint64_t> &target, std::uint64_t value) {
+    auto previous = target.load(std::memory_order_relaxed);
+    while (previous < value && !target.compare_exchange_weak(previous, value, std::memory_order_relaxed)) {
+    }
+  }
+
+  std::uint64_t qpc_now() {
+    LARGE_INTEGER counter {};
+    QueryPerformanceCounter(&counter);
+    return static_cast<std::uint64_t>(counter.QuadPart);
+  }
+
+  std::uint64_t qpc_delta_us(std::uint64_t start, std::uint64_t end) {
+    static const auto frequency = []() {
+      LARGE_INTEGER value {};
+      QueryPerformanceFrequency(&value);
+      return static_cast<std::uint64_t>(value.QuadPart);
+    }();
+
+    return frequency ? (end - start) * 1000000ull / frequency : 0;
+  }
+
+  std::uint64_t qpc_delta_us_checked(std::uint64_t start, std::uint64_t end) {
+    if (!start || !end || end < start) {
+      return 0;
+    }
+    return qpc_delta_us(start, end);
+  }
+
   bool read_exact(HANDLE pipe, void *data, DWORD size) {
     auto bytes = static_cast<std::uint8_t *>(data);
     DWORD total = 0;
@@ -155,8 +224,10 @@ namespace {
     return static_cast<int>(code);
   }
 
-  bool send_no_frame(HANDLE pipe) {
-    auto message = ipc::make_header(ipc::message_type::no_frame, sizeof(ipc::message_header));
+  bool send_no_frame(HANDLE pipe, std::uint64_t request_id) {
+    ipc::no_frame_message message {};
+    message.header = ipc::make_header(ipc::message_type::no_frame, sizeof(message));
+    message.request_id = request_id;
     return write_exact(pipe, &message, sizeof(message));
   }
 
@@ -212,6 +283,7 @@ namespace {
     winrt::GraphicsCaptureItem item {nullptr};
     winrt::Direct3D11CaptureFramePool frame_pool {nullptr};
     winrt::GraphicsCaptureSession capture_session {nullptr};
+    winrt::event_token frame_arrived_token {};
     winrt::com_ptr<::ABI::Windows::System::IDispatcherQueueController> dispatcher_queue_controller;
     HMODULE coremessaging_module {};
     DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -223,6 +295,8 @@ namespace {
       handle_guard shared_handle;
       D3D11_TEXTURE2D_DESC desc {};
       std::uint64_t qpc_timestamp {};
+      std::uint64_t sequence {};
+      std::uint64_t sent_qpc {};
       bool ready {};
       bool writing {};
       bool in_flight {};
@@ -233,6 +307,8 @@ namespace {
         shared_handle.reset();
         desc = {};
         qpc_timestamp = 0;
+        sequence = 0;
+        sent_qpc = 0;
         ready = false;
         writing = false;
         in_flight = false;
@@ -241,14 +317,39 @@ namespace {
 
     std::array<frame_slot, 2> slots;
     int latest_slot = -1;
+    std::uint64_t next_sequence = 1;
+    std::uint64_t last_sent_sequence = 0;
+    std::uint64_t last_capture_qpc = 0;
     std::mutex state_mutex;
     std::condition_variable state_cv;
+    std::mutex frame_mutex;
+    std::condition_variable frame_cv;
     std::mutex d3d_mutex;
     std::thread capture_thread;
+    bool frame_pending {};
+    bool frame_arrived_registered {};
     bool stopping {};
     bool fatal_error {};
     ipc::error_code fatal_code {};
     DWORD fatal_detail {};
+    std::atomic<std::uint64_t> captured_frames {};
+    std::atomic<std::uint64_t> empty_polls {};
+    std::atomic<std::uint64_t> frame_requests {};
+    std::atomic<std::uint64_t> frame_sends {};
+    std::atomic<std::uint64_t> frame_releases {};
+    std::atomic<std::uint64_t> no_frame_replies {};
+    std::atomic<std::uint64_t> slot_waits {};
+    std::atomic<std::uint64_t> request_wait_us {};
+    std::atomic<std::uint64_t> request_wait_max_us {};
+    std::atomic<std::uint64_t> frame_age_us {};
+    std::atomic<std::uint64_t> frame_age_max_us {};
+    std::atomic<std::uint64_t> capture_delta_max_us {};
+    std::atomic<std::uint64_t> release_held_us {};
+    std::atomic<std::uint64_t> release_held_max_us {};
+    std::atomic<std::uint64_t> copy_us {};
+    std::atomic<std::uint64_t> copy_max_us {};
+    std::mutex stats_log_mutex;
+    std::chrono::steady_clock::time_point last_stats_log {};
 
     ~wgc_session() {
       stop_capture_thread();
@@ -256,6 +357,10 @@ namespace {
         capture_session.Close();
       }
       if (frame_pool) {
+        if (frame_arrived_registered) {
+          frame_pool.FrameArrived(frame_arrived_token);
+          frame_arrived_registered = false;
+        }
         frame_pool.Close();
       }
       if (dispatcher_queue_controller) {
@@ -289,6 +394,16 @@ namespace {
     }
 
     ipc::error_code init(const ipc::init_message &message) {
+      {
+        std::ostringstream line;
+        line << "init display=";
+        std::wstring display {message.display_name};
+        line << std::string(display.begin(), display.end())
+             << " format=" << static_cast<unsigned>(message.format)
+             << " cursorVisible=" << message.cursor_visible;
+        g_log.write(line.str());
+      }
+
       try {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
       } catch (...) {
@@ -328,6 +443,14 @@ namespace {
           2,
           item.Size()
         );
+        frame_arrived_token = frame_pool.FrameArrived([this](auto const &, auto const &) {
+          {
+            std::lock_guard lock {frame_mutex};
+            frame_pending = true;
+          }
+          frame_cv.notify_one();
+        });
+        frame_arrived_registered = true;
         capture_session = frame_pool.CreateCaptureSession(item);
         if (winrt::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"IsBorderRequired")) {
           capture_session.IsBorderRequired(false);
@@ -346,6 +469,7 @@ namespace {
         return ipc::error_code::start_capture;
       }
 
+      g_log.write("capture started");
       return ipc::error_code {};
     }
 
@@ -413,16 +537,40 @@ namespace {
       return true;
     }
 
-    void release_slot(std::uint64_t shared_handle) {
+    void release_slot(const ipc::frame_release_message &release) {
       std::lock_guard lock {state_mutex};
       for (int i = 0; i < static_cast<int>(slots.size()); ++i) {
         auto &slot = slots[i];
-        if (slot.in_flight && reinterpret_cast<std::uint64_t>(slot.shared_handle.get()) == shared_handle) {
+        if (slot.in_flight && reinterpret_cast<std::uint64_t>(slot.shared_handle.get()) == release.shared_handle) {
+          const auto release_received_qpc = qpc_now();
+          const auto held_us = slot.sent_qpc ? qpc_delta_us(slot.sent_qpc, release_received_qpc) : 0;
+          release_held_us.fetch_add(held_us, std::memory_order_relaxed);
+          atomic_max(release_held_max_us, held_us);
+          if (slot.sequence <= 120 || slot.sequence % 120 == 0 || held_us > 50000 || release.sequence != slot.sequence) {
+            std::ostringstream line;
+            line << "trace seq=" << slot.sequence
+                 << " releaseSeq=" << release.sequence
+                 << " slot=" << i
+                 << " helperSendToMainRecvUs=" << qpc_delta_us_checked(slot.sent_qpc, release.main_received_qpc)
+                 << " mainRecvToAcquireUs=" << qpc_delta_us_checked(release.main_received_qpc, release.main_acquired_qpc)
+                 << " mainAcquireToReleaseUs=" << qpc_delta_us_checked(release.main_acquired_qpc, release.main_released_qpc)
+                 << " mainReleaseToHelperRecvUs=" << qpc_delta_us_checked(release.main_released_qpc, release_received_qpc)
+                 << " helperHeldUs=" << held_us
+                 << " frameAgeAtSendUs=" << qpc_delta_us_checked(slot.qpc_timestamp, slot.sent_qpc)
+                 << slot_summary_locked();
+            g_log.write(line.str());
+          }
           slot.in_flight = false;
+          slot.sent_qpc = 0;
+          frame_releases.fetch_add(1, std::memory_order_relaxed);
           state_cv.notify_all();
           return;
         }
       }
+      std::ostringstream line;
+      line << "release unknown seq=" << std::dec << release.sequence
+           << " handle=0x" << std::hex << release.shared_handle << slot_summary_locked();
+      g_log.write(line.str());
     }
 
     void set_fatal_error(ipc::error_code code, DWORD detail = 0) {
@@ -432,26 +580,98 @@ namespace {
         fatal_code = code;
         fatal_detail = detail;
       }
+      {
+        std::ostringstream line;
+        line << "fatal code=" << static_cast<unsigned>(code) << " detail=0x" << std::hex << detail;
+        g_log.write(line.str());
+      }
+      {
+        std::lock_guard frame_lock {frame_mutex};
+        frame_pending = true;
+      }
+      frame_cv.notify_all();
       state_cv.notify_all();
     }
 
+    void maybe_log_stats() {
+      std::lock_guard lock {stats_log_mutex};
+      const auto now = std::chrono::steady_clock::now();
+      if (last_stats_log.time_since_epoch().count() != 0 && now - last_stats_log < 2s) {
+        return;
+      }
+      last_stats_log = now;
+
+      const auto requests = frame_requests.load(std::memory_order_relaxed);
+      const auto sends = frame_sends.load(std::memory_order_relaxed);
+      const auto copies = captured_frames.load(std::memory_order_relaxed);
+      const auto releases = frame_releases.load(std::memory_order_relaxed);
+      const auto wait_avg = requests ? request_wait_us.load(std::memory_order_relaxed) / requests : 0;
+      const auto age_avg = sends ? frame_age_us.load(std::memory_order_relaxed) / sends : 0;
+      const auto copy_avg = copies ? copy_us.load(std::memory_order_relaxed) / copies : 0;
+      const auto release_avg = releases ? release_held_us.load(std::memory_order_relaxed) / releases : 0;
+
+      std::ostringstream line;
+      line << "stats captured=" << copies
+           << " sent=" << sends
+           << " requests=" << requests
+           << " noFrame=" << no_frame_replies.load(std::memory_order_relaxed)
+           << " releases=" << releases
+           << " emptyPolls=" << empty_polls.exchange(0, std::memory_order_relaxed)
+           << " slotWaits=" << slot_waits.load(std::memory_order_relaxed)
+           << " waitAvgUs=" << wait_avg
+           << " waitMaxUs=" << request_wait_max_us.exchange(0, std::memory_order_relaxed)
+           << " ageAvgUs=" << age_avg
+           << " ageMaxUs=" << frame_age_max_us.exchange(0, std::memory_order_relaxed)
+           << " captureDeltaMaxUs=" << capture_delta_max_us.exchange(0, std::memory_order_relaxed)
+           << " copyAvgUs=" << copy_avg
+           << " copyMaxUs=" << copy_max_us.exchange(0, std::memory_order_relaxed)
+           << " releaseHeldAvgUs=" << release_avg
+           << " releaseHeldMaxUs=" << release_held_max_us.exchange(0, std::memory_order_relaxed);
+      g_log.write(line.str());
+    }
+
+    std::string slot_summary_locked() const {
+      std::ostringstream line;
+      line << " latest=" << latest_slot;
+      for (std::size_t i = 0; i < slots.size(); ++i) {
+        const auto &slot = slots[i];
+        line << " s" << i
+             << "{seq=" << slot.sequence
+             << ",r=" << slot.ready
+             << ",w=" << slot.writing
+             << ",f=" << slot.in_flight
+             << "}";
+      }
+      return line.str();
+    }
+
     int select_writable_slot_locked() {
+      const auto writable = [&](int slot_index) {
+        const auto &slot = slots[slot_index];
+        return !slot.in_flight &&
+               !slot.writing &&
+               (!slot.texture || slot.mutex);
+      };
+
+      // Prefer the non-latest slot to avoid overwriting a frame that is ready for the main process.
+      // If that slot is still in-flight, overwrite latest instead. A ready-but-unsent frame is only
+      // a mailbox value; keeping it must never block newer WGC frames from replacing it.
       if (latest_slot >= 0) {
         const int other = 1 - latest_slot;
-        if (!slots[other].in_flight &&
-            !slots[other].writing &&
-            (!slots[other].texture || slots[other].mutex)) {
+        if (writable(other)) {
           return other;
+        }
+        if (writable(latest_slot)) {
+          return latest_slot;
         }
         return -1;
       }
 
       for (int i = 0; i < static_cast<int>(slots.size()); ++i) {
-        if (!slots[i].in_flight && !slots[i].writing && (!slots[i].texture || slots[i].mutex)) {
+        if (writable(i)) {
           return i;
         }
       }
-
       return -1;
     }
 
@@ -474,6 +694,23 @@ namespace {
           }
         }
 
+        {
+          std::unique_lock lock {frame_mutex};
+          if (!frame_pending) {
+            frame_cv.wait(lock, [&]() {
+              return frame_pending;
+            });
+          }
+          frame_pending = false;
+        }
+
+        {
+          std::lock_guard lock {state_mutex};
+          if (stopping || fatal_error) {
+            return;
+          }
+        }
+
         winrt::Direct3D11CaptureFrame newest_frame {nullptr};
         try {
           while (auto frame = frame_pool.TryGetNextFrame()) {
@@ -488,7 +725,27 @@ namespace {
         }
 
         if (!newest_frame) {
-          Sleep(0);
+          empty_polls.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+
+        int slot_index = -1;
+        {
+          std::lock_guard lock {state_mutex};
+          slot_index = select_writable_slot_locked();
+          if (slot_index < 0) {
+            slot_waits.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            slots[slot_index].writing = true;
+            slots[slot_index].ready = false;
+          }
+        }
+        if (stopping || fatal_error) {
+          return;
+        }
+        if (slot_index < 0) {
+          // Never hold a WGC frame while waiting for the encoder side to release a shared slot.
+          // Dropping here lets the next loop drain the frame pool and copy the newest frame instead.
           continue;
         }
 
@@ -496,6 +753,10 @@ namespace {
         com_ptr<ID3D11Texture2D> src;
         HRESULT surface_status = access ? access->GetInterface(IID_ID3D11Texture2D, src.put_void()) : E_NOINTERFACE;
         if (!access || FAILED(surface_status)) {
+          {
+            std::lock_guard lock {state_mutex};
+            slots[slot_index].writing = false;
+          }
           set_fatal_error(ipc::error_code::frame_surface, static_cast<DWORD>(surface_status));
           return;
         }
@@ -503,27 +764,16 @@ namespace {
         D3D11_TEXTURE2D_DESC desc {};
         src->GetDesc(&desc);
 
-        int slot_index = -1;
         {
-          std::unique_lock lock {state_mutex};
-          slot_index = select_writable_slot_locked();
-          if (slot_index < 0) {
-            state_cv.wait(lock, [&]() {
-              if (stopping || fatal_error) {
-                return true;
-              }
-              slot_index = select_writable_slot_locked();
-              return slot_index >= 0;
-            });
-          }
+          std::lock_guard lock {state_mutex};
           if (stopping || fatal_error) {
+            slots[slot_index].writing = false;
             return;
           }
-          slots[slot_index].writing = true;
-          slots[slot_index].ready = false;
         }
 
         bool ok = true;
+        const auto copy_start = qpc_now();
         {
           std::lock_guard d3d_lock {d3d_mutex};
           ok = ensure_slot_texture(slots[slot_index], desc);
@@ -544,6 +794,9 @@ namespace {
             }
           }
         }
+        const auto copy_time_us = qpc_delta_us(copy_start, qpc_now());
+        copy_us.fetch_add(copy_time_us, std::memory_order_relaxed);
+        atomic_max(copy_max_us, copy_time_us);
 
         {
           std::lock_guard lock {state_mutex};
@@ -553,9 +806,15 @@ namespace {
             fatal_code = ipc::error_code::shared_texture;
             fatal_detail = static_cast<DWORD>(last_shared_texture_status);
           } else {
+            const auto frame_qpc = newest_frame.SystemRelativeTime().count();
+            const auto capture_delta_us = last_capture_qpc ? qpc_delta_us(last_capture_qpc, frame_qpc) : 0;
             slots[slot_index].qpc_timestamp = newest_frame.SystemRelativeTime().count();
+            slots[slot_index].sequence = next_sequence++;
             slots[slot_index].ready = true;
             latest_slot = slot_index;
+            last_capture_qpc = frame_qpc;
+            captured_frames.fetch_add(1, std::memory_order_relaxed);
+            atomic_max(capture_delta_max_us, capture_delta_us);
           }
         }
         state_cv.notify_all();
@@ -573,15 +832,32 @@ namespace {
         std::lock_guard lock {state_mutex};
         stopping = true;
       }
+      {
+        std::lock_guard frame_lock {frame_mutex};
+        frame_pending = true;
+      }
+      frame_cv.notify_all();
       state_cv.notify_all();
       if (capture_thread.joinable()) {
         capture_thread.join();
       }
     }
 
-    bool send_requested_frame(HANDLE pipe, std::chrono::milliseconds timeout) {
+    bool send_requested_frame(HANDLE pipe, const ipc::frame_request_message &request) {
+      frame_requests.fetch_add(1, std::memory_order_relaxed);
+      const auto request_start = qpc_now();
+      const auto timeout = std::chrono::milliseconds(request.timeout_ms);
       int slot_index = -1;
       ipc::frame_message message {};
+
+      auto frame_available_locked = [&]() {
+        return latest_slot >= 0 &&
+               slots[latest_slot].ready &&
+               !slots[latest_slot].writing &&
+               !slots[latest_slot].in_flight &&
+               slots[latest_slot].mutex &&
+               slots[latest_slot].sequence > last_sent_sequence;
+      };
 
       {
         std::unique_lock lock {state_mutex};
@@ -589,35 +865,18 @@ namespace {
           send_error(pipe, fatal_code, fatal_detail);
           return false;
         }
-
-        if (latest_slot < 0 ||
-            !slots[latest_slot].ready ||
-            slots[latest_slot].writing ||
-            slots[latest_slot].in_flight ||
-            !slots[latest_slot].mutex) {
-          if (timeout > 0ms) {
-            state_cv.wait_for(lock, timeout, [&]() {
-              return fatal_error ||
-                     (latest_slot >= 0 &&
-                      slots[latest_slot].ready &&
-                      !slots[latest_slot].writing &&
-                      !slots[latest_slot].in_flight &&
-                      slots[latest_slot].mutex);
-            });
-          }
-        }
-
         if (fatal_error) {
           send_error(pipe, fatal_code, fatal_detail);
           return false;
         }
-        if (latest_slot < 0 ||
-            !slots[latest_slot].ready ||
-            slots[latest_slot].writing ||
-            slots[latest_slot].in_flight ||
-            !slots[latest_slot].mutex) {
+        if (!frame_available_locked()) {
           lock.unlock();
-          return send_no_frame(pipe);
+          no_frame_replies.fetch_add(1, std::memory_order_relaxed);
+          const auto wait_time_us = qpc_delta_us(request_start, qpc_now());
+          request_wait_us.fetch_add(wait_time_us, std::memory_order_relaxed);
+          atomic_max(request_wait_max_us, wait_time_us);
+          maybe_log_stats();
+          return send_no_frame(pipe, request.request_id);
         }
 
         slot_index = latest_slot;
@@ -630,7 +889,12 @@ namespace {
         const HRESULT acquire_status = slot.mutex->AcquireSync(0, 0);
         if (mutex_timeout(acquire_status)) {
           lock.unlock();
-          return send_no_frame(pipe);
+          no_frame_replies.fetch_add(1, std::memory_order_relaxed);
+          const auto wait_time_us = qpc_delta_us(request_start, qpc_now());
+          request_wait_us.fetch_add(wait_time_us, std::memory_order_relaxed);
+          atomic_max(request_wait_max_us, wait_time_us);
+          maybe_log_stats();
+          return send_no_frame(pipe, request.request_id);
         }
         if (FAILED(acquire_status)) {
           send_error(pipe, ipc::error_code::shared_texture, detail_code(0xB1, acquire_status));
@@ -643,7 +907,8 @@ namespace {
           return false;
         }
         slot.in_flight = true;
-        slot.ready = false;
+        last_sent_sequence = slot.sequence;
+        slot.sent_qpc = qpc_now();
 
         message.header = ipc::make_header(ipc::message_type::frame, sizeof(message));
         message.shared_handle = reinterpret_cast<std::uint64_t>(slot.shared_handle.get());
@@ -651,24 +916,47 @@ namespace {
         message.height = slot.desc.Height;
         message.format = slot.desc.Format;
         message.qpc_timestamp = slot.qpc_timestamp;
+        message.sequence = slot.sequence;
+        message.helper_send_qpc = slot.sent_qpc;
+        message.request_id = request.request_id;
+      }
+      const auto send_qpc = qpc_now();
+      const auto wait_time_us = qpc_delta_us(request_start, send_qpc);
+      const auto age_time_us = message.qpc_timestamp <= send_qpc ? qpc_delta_us(message.qpc_timestamp, send_qpc) : 0;
+      request_wait_us.fetch_add(wait_time_us, std::memory_order_relaxed);
+      atomic_max(request_wait_max_us, wait_time_us);
+      frame_age_us.fetch_add(age_time_us, std::memory_order_relaxed);
+      atomic_max(frame_age_max_us, age_time_us);
+      frame_sends.fetch_add(1, std::memory_order_relaxed);
+      if (wait_time_us > 20000 || age_time_us > 50000) {
+        std::ostringstream line;
+        line << "slow send waitUs=" << wait_time_us
+             << " ageUs=" << age_time_us
+             << " timeoutMs=" << timeout.count()
+             << " slot=" << slot_index;
+        g_log.write(line.str());
       }
       if (!write_exact(pipe, &message, sizeof(message))) {
         return false;
       }
+      maybe_log_stats();
 
       return true;
     }
   };
 
   int run_helper(const wchar_t *pipe_name) {
+    g_log.write("helper starting");
     handle_guard pipe {CreateFileW(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr)};
     if (!pipe) {
+      g_log.write("failed to open pipe");
       return static_cast<int>(GetLastError());
     }
 
     ipc::init_message init {};
     if (!read_exact(pipe.get(), &init, sizeof(init)) ||
         !ipc::valid_header(init.header, ipc::message_type::init, sizeof(init))) {
+      g_log.write("invalid init message");
       return ERROR_INVALID_DATA;
     }
 
@@ -686,6 +974,7 @@ namespace {
       }
 
       if (ipc::valid_header(header, ipc::message_type::shutdown, sizeof(header))) {
+        g_log.write("shutdown requested");
         session.stop_capture_thread();
         return 0;
       }
@@ -698,7 +987,7 @@ namespace {
           return ERROR_BROKEN_PIPE;
         }
         try {
-          if (!session.send_requested_frame(pipe.get(), std::chrono::milliseconds(request.timeout_ms))) {
+          if (!session.send_requested_frame(pipe.get(), request)) {
             Sleep(10);
             session.stop_capture_thread();
             return static_cast<int>(ipc::error_code::generic);
@@ -722,7 +1011,7 @@ namespace {
           session.stop_capture_thread();
           return ERROR_BROKEN_PIPE;
         }
-        session.release_slot(release.shared_handle);
+        session.release_slot(release);
       } else {
         session.stop_capture_thread();
         return ERROR_INVALID_DATA;
@@ -744,9 +1033,24 @@ int main() {
     }
   } argv_guard {argv};
 
-  if (argc != 3 || wcscmp(argv[1], L"--pipe") != 0) {
-    return ERROR_INVALID_PARAMETER;
+  const wchar_t *pipe_name = nullptr;
+  const wchar_t *log_path = nullptr;
+  for (int i = 1; i + 1 < argc; i += 2) {
+    if (wcscmp(argv[i], L"--pipe") == 0) {
+      pipe_name = argv[i + 1];
+    } else if (wcscmp(argv[i], L"--log") == 0) {
+      log_path = argv[i + 1];
+    } else {
+      return ERROR_INVALID_PARAMETER;
+    }
   }
 
-  return run_helper(argv[2]);
+  if (!pipe_name) {
+    return ERROR_INVALID_PARAMETER;
+  }
+  if (log_path) {
+    g_log.open(log_path);
+  }
+
+  return run_helper(pipe_name);
 }

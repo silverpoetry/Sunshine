@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <filesystem>
 #include <thread>
 #include <vector>
 
@@ -213,6 +214,16 @@ namespace platf::dxgi {
       path.resize(slash + 1);
       path += L"tools\\sunshine-wgc-helper.exe";
       return path;
+    }
+
+    std::wstring helper_log_path() {
+      wchar_t module_path[MAX_PATH];
+      GetModuleFileNameW(nullptr, module_path, _countof(module_path));
+      std::filesystem::path path {module_path};
+      path = path.parent_path() / L"config" / L"wgc-helper.log";
+      std::error_code ec;
+      std::filesystem::create_directories(path.parent_path(), ec);
+      return path.wstring();
     }
 
     bool connect_pipe_with_timeout(HANDLE pipe, std::chrono::milliseconds timeout) {
@@ -469,7 +480,8 @@ namespace platf::dxgi {
     });
 
     auto exe = helper_path();
-    auto command = L"\""s + exe + L"\" --pipe \"" + pipe_name + L"\"";
+    auto log_path = helper_log_path();
+    auto command = L"\""s + exe + L"\" --pipe \"" + pipe_name + L"\" --log \"" + log_path + L"\"";
 
     STARTUPINFOW startup_info {};
     startup_info.cb = sizeof(startup_info);
@@ -605,6 +617,11 @@ namespace platf::dxgi {
           helper_ipc::frame_release_message message {};
           message.header = helper_ipc::make_header(helper_ipc::message_type::frame_release, sizeof(message));
           message.shared_handle = reinterpret_cast<std::uint64_t>(locked_handle);
+          message.sequence = helper_frame_sequence;
+          message.helper_send_qpc = helper_frame_send_qpc;
+          message.main_received_qpc = helper_frame_received_qpc;
+          message.main_acquired_qpc = helper_frame_acquired_qpc;
+          message.main_released_qpc = static_cast<std::uint64_t>(qpc_counter());
           if (!write_exact(helper_pipe, &message, sizeof(message))) {
             return capture_e::error;
           }
@@ -660,53 +677,20 @@ namespace platf::dxgi {
 
     helper_ipc::frame_request_message request {};
     request.header = helper_ipc::make_header(helper_ipc::message_type::frame_request, sizeof(request));
-    request.timeout_ms = timeout <= 0ms ? 0u : static_cast<std::uint32_t>(std::min<std::int64_t>(timeout.count(), 1000));
+    // The helper owns a mailbox of already-captured frames. Requests must be
+    // non-blocking so frame release messages are never stuck behind a wait.
+    request.timeout_ms = 0;
+    request.request_id = ++helper_next_request_id;
     if (!write_exact(helper_pipe, &request, sizeof(request))) {
       return capture_e::error;
     }
 
-    auto wait_time = std::chrono::milliseconds(request.timeout_ms) + 10ms;
+    auto wait_time = 50ms;
 
-    helper_ipc::message_header header {};
-    switch (read_exact_timeout(helper_pipe, &header, sizeof(header), wait_time)) {
-      case pipe_read_e::ok:
-        break;
-      case pipe_read_e::timeout:
-        return capture_e::timeout;
-      case pipe_read_e::error:
-        return capture_e::error;
-    }
-
-    if (header.type == helper_ipc::message_type::no_frame && header.size == sizeof(helper_ipc::message_header)) {
-      return capture_e::timeout;
-    }
-
-    if (header.type == helper_ipc::message_type::error) {
-      helper_ipc::error_message message {};
-      message.header = header;
-      read_exact(helper_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header));
-      BOOST_LOG(warning) << "WGC helper reported an error [0x"sv << util::hex(message.code).to_string_view()
-                         << "] detail [0x"sv << util::hex(message.detail).to_string_view() << ']';
-      stop_helper();
-      return capture_e::error;
-    }
-
-    if (header.type != helper_ipc::message_type::frame || header.size != sizeof(helper_ipc::frame_message)) {
-      return capture_e::error;
-    }
-
-    helper_ipc::frame_message message {};
-    message.header = header;
-    switch (read_exact_timeout(helper_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header), wait_time)) {
-      case pipe_read_e::ok:
-        break;
-      case pipe_read_e::timeout:
-        return capture_e::timeout;
-      case pipe_read_e::error:
-        return capture_e::error;
-    }
-
-    if (helper_remote_texture_handle != reinterpret_cast<HANDLE>(message.shared_handle)) {
+    auto ensure_helper_texture = [&](const helper_ipc::frame_message &message) -> bool {
+      if (helper_remote_texture_handle == reinterpret_cast<HANDLE>(message.shared_handle)) {
+        return true;
+      }
       helper_texture.reset();
       helper_mutex.reset();
       helper_remote_texture_handle = nullptr;
@@ -722,7 +706,7 @@ namespace platf::dxgi {
             FALSE,
             DUPLICATE_SAME_ACCESS
           )) {
-        return capture_e::error;
+        return false;
       }
       helper_remote_texture_handle = reinterpret_cast<HANDLE>(message.shared_handle);
 
@@ -733,17 +717,86 @@ namespace platf::dxgi {
           FAILED(device1->OpenSharedResource1(duplicated_handle, IID_ID3D11Resource, resource.put_void())) ||
           FAILED(resource->QueryInterface(IID_ID3D11Texture2D, (void **) &helper_texture))) {
         CloseHandle(duplicated_handle);
-        return capture_e::error;
+        return false;
       }
       CloseHandle(duplicated_handle);
       if (FAILED(helper_texture->QueryInterface(IID_IDXGIKeyedMutex, (void **) &helper_mutex))) {
         helper_texture.reset();
         helper_mutex.reset();
+        return false;
+      }
+      return true;
+    };
+
+    auto release_helper_message = [&](const helper_ipc::frame_message &message, std::uint64_t received_qpc, std::uint64_t acquired_qpc) -> bool {
+      helper_ipc::frame_release_message release {};
+      release.header = helper_ipc::make_header(helper_ipc::message_type::frame_release, sizeof(release));
+      release.shared_handle = message.shared_handle;
+      release.sequence = message.sequence;
+      release.helper_send_qpc = message.helper_send_qpc;
+      release.main_received_qpc = received_qpc;
+      release.main_acquired_qpc = acquired_qpc;
+      release.main_released_qpc = static_cast<std::uint64_t>(qpc_counter());
+      return write_exact(helper_pipe, &release, sizeof(release));
+    };
+
+    while (true) {
+      helper_ipc::message_header header {};
+      switch (read_exact_timeout(helper_pipe, &header, sizeof(header), wait_time)) {
+        case pipe_read_e::ok:
+          break;
+        case pipe_read_e::timeout:
+          return capture_e::timeout;
+        case pipe_read_e::error:
+          return capture_e::error;
+      }
+
+      if (header.type == helper_ipc::message_type::no_frame && header.size == sizeof(helper_ipc::no_frame_message)) {
+        helper_ipc::no_frame_message message {};
+        message.header = header;
+        switch (read_exact_timeout(helper_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header), wait_time)) {
+          case pipe_read_e::ok:
+            break;
+          case pipe_read_e::timeout:
+            return capture_e::timeout;
+          case pipe_read_e::error:
+            return capture_e::error;
+        }
+        if (message.request_id == request.request_id) {
+          return capture_e::timeout;
+        }
+        continue;
+      }
+
+      if (header.type == helper_ipc::message_type::error) {
+        helper_ipc::error_message message {};
+        message.header = header;
+        read_exact(helper_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header));
+        BOOST_LOG(warning) << "WGC helper reported an error [0x"sv << util::hex(message.code).to_string_view()
+                           << "] detail [0x"sv << util::hex(message.detail).to_string_view() << ']';
+        stop_helper();
         return capture_e::error;
       }
-    }
 
-    if (helper_mutex) {
+      if (header.type != helper_ipc::message_type::frame || header.size != sizeof(helper_ipc::frame_message)) {
+        return capture_e::error;
+      }
+
+      helper_ipc::frame_message message {};
+      message.header = header;
+      switch (read_exact_timeout(helper_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header), wait_time)) {
+        case pipe_read_e::ok:
+          break;
+        case pipe_read_e::timeout:
+          return capture_e::timeout;
+        case pipe_read_e::error:
+          return capture_e::error;
+      }
+      const auto received_qpc = static_cast<std::uint64_t>(qpc_counter());
+
+      if (!ensure_helper_texture(message) || !helper_mutex) {
+        return capture_e::error;
+      }
       const HRESULT acquire_status = helper_mutex->AcquireSync(1, 1000);
       if (acquire_status == WAIT_TIMEOUT || acquire_status == HRESULT_FROM_WIN32(WAIT_TIMEOUT)) {
         return capture_e::timeout;
@@ -751,12 +804,25 @@ namespace platf::dxgi {
       if (FAILED(acquire_status)) {
         return capture_e::error;
       }
+      const auto acquired_qpc = static_cast<std::uint64_t>(qpc_counter());
+
+      if (message.request_id != request.request_id) {
+        if (FAILED(helper_mutex->ReleaseSync(0)) || !release_helper_message(message, received_qpc, acquired_qpc)) {
+          return capture_e::error;
+        }
+        continue;
+      }
+
+      helper_frame_locked = true;
+      helper_frame_sequence = message.sequence;
+      helper_frame_send_qpc = message.helper_send_qpc;
+      helper_frame_received_qpc = received_qpc;
+      helper_frame_acquired_qpc = acquired_qpc;
+      *out = helper_texture.get();
+      (*out)->AddRef();
+      out_time = message.qpc_timestamp;
+      return capture_e::ok;
     }
-    helper_frame_locked = helper_mutex != nullptr;
-    *out = helper_texture.get();
-    (*out)->AddRef();
-    out_time = message.qpc_timestamp;
-    return capture_e::ok;
   }
 
   void wgc_capture_t::stop_helper() {
