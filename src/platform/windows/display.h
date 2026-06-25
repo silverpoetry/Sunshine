@@ -5,9 +5,12 @@
 #pragma once
 
 // platform includes
+#include <chrono>
+
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <d3dcommon.h>
+#include <dispatcherqueue.h>
 #include <dwmapi.h>
 #include <dxgi.h>
 #include <dxgi1_6.h>
@@ -349,10 +352,26 @@ namespace platf::dxgi {
     winrt::Windows::Graphics::Capture::GraphicsCaptureSession capture_session {nullptr};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame produced_frame {nullptr};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame consumed_frame {nullptr};
+    winrt::com_ptr<::ABI::Windows::System::IDispatcherQueueController> dispatcher_queue_controller;
+    HMODULE coremessaging_module {};
     SRWLOCK frame_lock = SRWLOCK_INIT;
     CONDITION_VARIABLE frame_present_cv;
+    HANDLE helper_pipe {};
+    HANDLE helper_process {};
+    HANDLE helper_thread {};
+    ID3D11Device *helper_device {};
+    HANDLE helper_remote_texture_handle {};
+    texture2d_t helper_texture;
+    util::safe_ptr<IDXGIKeyedMutex, Release<IDXGIKeyedMutex>> helper_mutex;
+    std::wstring helper_texture_name;
+    bool helper_active {};
+    bool helper_cursor_visible {};
+    bool helper_frame_locked {};
 
     void on_frame_arrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender, winrt::Windows::Foundation::IInspectable const &);
+    int init_helper(display_base_t *display, const ::video::config_t &config);
+    capture_e next_helper_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time);
+    void stop_helper();
 
   public:
     wgc_capture_t();
@@ -362,6 +381,7 @@ namespace platf::dxgi {
     capture_e next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time);
     capture_e release_frame();
     int set_cursor_visible(bool);
+    bool is_helper_active() const;
   };
 
   /**

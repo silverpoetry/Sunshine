@@ -2,13 +2,21 @@
  * @file src/platform/windows/display_wgc.cpp
  * @brief Definitions for WinRT Windows.Graphics.Capture API
  */
+// standard includes
+#include <thread>
+#include <vector>
+
 // platform includes
 #include <dxgi1_2.h>
+#include <sddl.h>
+#include <userenv.h>
+#include <WtsApi32.h>
 
 // local includes
 #include "display.h"
 #include "misc.h"
 #include "src/logging.h"
+#include "wgc_helper_ipc.h"
 
 // Gross hack to work around MINGW-packages#22160
 #define ____FIReference_1_boolean_INTERFACE_DEFINED__
@@ -61,16 +69,228 @@ constexpr auto __mingw_uuidof<winrt::IDirect3DDxgiInterfaceAccess>() -> GUID con
 #endif
 
 namespace platf::dxgi {
+  namespace {
+    namespace helper_ipc = wgc_helper;
+
+    bool is_local_system_process() {
+      HANDLE token {};
+      if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return false;
+      }
+      auto token_guard = util::fail_guard([&]() {
+        CloseHandle(token);
+      });
+
+      DWORD size = 0;
+      GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+      std::vector<std::uint8_t> buffer(size);
+      if (!GetTokenInformation(token, TokenUser, buffer.data(), size, &size)) {
+        return false;
+      }
+
+      PSID system_sid {};
+      if (!ConvertStringSidToSidW(L"S-1-5-18", &system_sid)) {
+        return false;
+      }
+      auto sid_guard = util::fail_guard([&]() {
+        LocalFree(system_sid);
+      });
+
+      auto token_user = reinterpret_cast<TOKEN_USER *>(buffer.data());
+      return EqualSid(token_user->User.Sid, system_sid);
+    }
+
+    bool pipe_io(HANDLE pipe, void *data, DWORD size, bool write) {
+      auto bytes = static_cast<std::uint8_t *>(data);
+      DWORD total = 0;
+      while (total < size) {
+        OVERLAPPED overlapped {};
+        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!overlapped.hEvent) {
+          return false;
+        }
+        auto event_guard = util::fail_guard([&]() {
+          CloseHandle(overlapped.hEvent);
+        });
+
+        DWORD chunk = 0;
+        BOOL ok;
+        if (write) {
+          ok = WriteFile(pipe, bytes + total, size - total, &chunk, &overlapped);
+        } else {
+          ok = ReadFile(pipe, bytes + total, size - total, &chunk, &overlapped);
+        }
+
+        if (!ok) {
+          const auto error = GetLastError();
+          if (error != ERROR_IO_PENDING) {
+            return false;
+          }
+          if (WaitForSingleObject(overlapped.hEvent, INFINITE) != WAIT_OBJECT_0 ||
+              !GetOverlappedResult(pipe, &overlapped, &chunk, FALSE)) {
+            return false;
+          }
+        }
+
+        if (!chunk) {
+          return false;
+        }
+        total += chunk;
+      }
+      return true;
+    }
+
+    bool read_exact(HANDLE pipe, void *data, DWORD size) {
+      return pipe_io(pipe, data, size, false);
+    }
+
+    bool write_exact(HANDLE pipe, const void *data, DWORD size) {
+      return pipe_io(pipe, const_cast<void *>(data), size, true);
+    }
+
+    enum class pipe_read_e {
+      ok,
+      timeout,
+      error,
+    };
+
+    pipe_read_e read_exact_timeout(HANDLE pipe, void *data, DWORD size, std::chrono::milliseconds timeout) {
+      auto bytes = static_cast<std::uint8_t *>(data);
+      DWORD total = 0;
+      const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+      while (total < size) {
+        OVERLAPPED overlapped {};
+        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!overlapped.hEvent) {
+          return pipe_read_e::error;
+        }
+        auto event_guard = util::fail_guard([&]() {
+          CloseHandle(overlapped.hEvent);
+        });
+
+        DWORD chunk = 0;
+        if (!ReadFile(pipe, bytes + total, size - total, &chunk, &overlapped)) {
+          const auto error = GetLastError();
+          if (error != ERROR_IO_PENDING) {
+            return pipe_read_e::error;
+          }
+
+          const auto now = std::chrono::steady_clock::now();
+          if (now >= deadline) {
+            CancelIo(pipe);
+            return pipe_read_e::timeout;
+          }
+
+          const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+          if (WaitForSingleObject(overlapped.hEvent, static_cast<DWORD>(remaining.count())) != WAIT_OBJECT_0) {
+            CancelIo(pipe);
+            return pipe_read_e::timeout;
+          }
+          if (!GetOverlappedResult(pipe, &overlapped, &chunk, FALSE)) {
+            return pipe_read_e::error;
+          }
+        }
+
+        if (!chunk) {
+          return pipe_read_e::error;
+        }
+        total += chunk;
+      }
+
+      return pipe_read_e::ok;
+    }
+
+    std::wstring helper_path() {
+      wchar_t module_path[MAX_PATH];
+      GetModuleFileNameW(nullptr, module_path, _countof(module_path));
+      std::wstring path {module_path};
+      auto slash = path.find_last_of(L"\\/");
+      if (slash == std::wstring::npos) {
+        return L"tools\\sunshine-wgc-helper.exe";
+      }
+      path.resize(slash + 1);
+      path += L"tools\\sunshine-wgc-helper.exe";
+      return path;
+    }
+
+    bool connect_pipe_with_timeout(HANDLE pipe, std::chrono::milliseconds timeout) {
+      OVERLAPPED overlapped {};
+      overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      if (!overlapped.hEvent) {
+        return false;
+      }
+      auto event_guard = util::fail_guard([&]() {
+        CloseHandle(overlapped.hEvent);
+      });
+
+      if (ConnectNamedPipe(pipe, &overlapped)) {
+        return true;
+      }
+
+      const auto error = GetLastError();
+      if (error == ERROR_PIPE_CONNECTED) {
+        return true;
+      }
+      if (error != ERROR_IO_PENDING) {
+        return false;
+      }
+
+      if (WaitForSingleObject(overlapped.hEvent, static_cast<DWORD>(timeout.count())) != WAIT_OBJECT_0) {
+        CancelIo(pipe);
+        return false;
+      }
+
+      DWORD transferred = 0;
+      return GetOverlappedResult(pipe, &overlapped, &transferred, FALSE);
+    }
+
+    std::string helper_exit_status(HANDLE process) {
+      if (!process || WaitForSingleObject(process, 0) != WAIT_OBJECT_0) {
+        return "still running"s;
+      }
+
+      DWORD exit_code = 0;
+      if (!GetExitCodeProcess(process, &exit_code)) {
+        return "unknown"s;
+      }
+
+      return "exited 0x"s + util::hex(exit_code).to_string();
+    }
+
+    HANDLE query_console_user_token() {
+      const auto session_id = WTSGetActiveConsoleSessionId();
+      if (session_id == 0xFFFFFFFF) {
+        return nullptr;
+      }
+
+      HANDLE token {};
+      if (!WTSQueryUserToken(session_id, &token)) {
+        return nullptr;
+      }
+      return token;
+    }
+  }  // namespace
+
   wgc_capture_t::wgc_capture_t() {
     InitializeConditionVariable(&frame_present_cv);
   }
 
   wgc_capture_t::~wgc_capture_t() {
+    stop_helper();
     if (capture_session) {
       capture_session.Close();
     }
     if (frame_pool) {
       frame_pool.Close();
+    }
+    if (dispatcher_queue_controller) {
+      dispatcher_queue_controller->ShutdownQueueAsync(nullptr);
+      dispatcher_queue_controller = nullptr;
+    }
+    if (coremessaging_module) {
+      FreeLibrary(coremessaging_module);
+      coremessaging_module = nullptr;
     }
     item = nullptr;
     capture_session = nullptr;
@@ -82,9 +302,48 @@ namespace platf::dxgi {
    * @return 0 on success, -1 on failure.
    */
   int wgc_capture_t::init(display_base_t *display, const ::video::config_t &config) {
+    if (is_local_system_process() && init_helper(display, config) == 0) {
+      helper_active = true;
+      BOOST_LOG(info) << "Using user-session WGC helper for service-hosted capture"sv;
+      return 0;
+    }
+
     HRESULT status;
     dxgi::dxgi_t dxgi;
     winrt::com_ptr<::IInspectable> d3d_comhandle;
+
+    try {
+      winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (winrt::hresult_error &e) {
+      BOOST_LOG(debug) << "WGC: WinRT apartment initialization returned [0x"sv << util::hex(e.code()).to_string_view() << ']';
+    }
+
+    MSG msg;
+    PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE);
+
+    DispatcherQueueOptions options {};
+    options.dwSize = sizeof(options);
+    options.threadType = DQTYPE_THREAD_CURRENT;
+    options.apartmentType = DQTAT_COM_NONE;
+
+    coremessaging_module = LoadLibraryW(L"coremessaging.dll");
+    if (!coremessaging_module) {
+      BOOST_LOG(error) << "Failed to load coremessaging.dll for WGC dispatcher queue";
+      return -1;
+    }
+
+    auto create_dispatcher_queue_controller = reinterpret_cast<decltype(&CreateDispatcherQueueController)>(GetProcAddress(coremessaging_module, "CreateDispatcherQueueController"));
+    if (!create_dispatcher_queue_controller) {
+      BOOST_LOG(error) << "Failed to find CreateDispatcherQueueController for WGC dispatcher queue";
+      return -1;
+    }
+
+    status = create_dispatcher_queue_controller(options, dispatcher_queue_controller.put());
+    if (FAILED(status)) {
+      BOOST_LOG(error) << "Failed to create WGC dispatcher queue [0x"sv << util::hex(status).to_string_view() << ']';
+      return -1;
+    }
+
     try {
       if (!winrt::GraphicsCaptureSession::IsSupported()) {
         BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows!"sv;
@@ -155,6 +414,115 @@ namespace platf::dxgi {
     return 0;
   }
 
+  int wgc_capture_t::init_helper(display_base_t *display, const ::video::config_t &config) {
+    auto pipe_name = std::wstring {L"\\\\.\\pipe\\SunshineWgcHelper-"} + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+    PSECURITY_DESCRIPTOR pipe_sd {};
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+          L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)(A;;GA;;;AU)",
+          SDDL_REVISION_1,
+          &pipe_sd,
+          nullptr
+        )) {
+      BOOST_LOG(warning) << "Failed to create WGC helper pipe security descriptor [0x"sv << util::hex(GetLastError()).to_string_view() << ']';
+      return -1;
+    }
+    auto pipe_sd_guard = util::fail_guard([&]() {
+      LocalFree(pipe_sd);
+    });
+
+    SECURITY_ATTRIBUTES pipe_security {};
+    pipe_security.nLength = sizeof(pipe_security);
+    pipe_security.lpSecurityDescriptor = pipe_sd;
+
+    helper_pipe = CreateNamedPipeW(
+      pipe_name.c_str(),
+      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+      1,
+      1024 * 1024,
+      1024 * 1024,
+      0,
+      &pipe_security
+    );
+    if (!helper_pipe || helper_pipe == INVALID_HANDLE_VALUE) {
+      helper_pipe = nullptr;
+      return -1;
+    }
+
+    auto token = query_console_user_token();
+    if (!token) {
+      stop_helper();
+      return -1;
+    }
+    auto token_guard = util::fail_guard([&]() {
+      CloseHandle(token);
+    });
+
+    PVOID environment_block {};
+    if (!CreateEnvironmentBlock(&environment_block, token, FALSE)) {
+      stop_helper();
+      return -1;
+    }
+    auto env_guard = util::fail_guard([&]() {
+      DestroyEnvironmentBlock(environment_block);
+    });
+
+    auto exe = helper_path();
+    auto command = L"\""s + exe + L"\" --pipe \"" + pipe_name + L"\"";
+
+    STARTUPINFOW startup_info {};
+    startup_info.cb = sizeof(startup_info);
+    startup_info.lpDesktop = (LPWSTR) L"winsta0\\default";
+
+    PROCESS_INFORMATION process_info {};
+    if (!CreateProcessAsUserW(
+          token,
+          exe.c_str(),
+          command.data(),
+          nullptr,
+          nullptr,
+          FALSE,
+          CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+          environment_block,
+          nullptr,
+          &startup_info,
+          &process_info
+        )) {
+      BOOST_LOG(warning) << "Failed to launch WGC helper [0x"sv << util::hex(GetLastError()).to_string_view() << ']';
+      stop_helper();
+      return -1;
+    }
+
+    helper_process = process_info.hProcess;
+    helper_thread = process_info.hThread;
+
+    if (!connect_pipe_with_timeout(helper_pipe, 5s)) {
+      BOOST_LOG(warning) << "WGC helper did not connect to the pipe in time; helper is "sv << helper_exit_status(helper_process);
+      stop_helper();
+      return -1;
+    }
+
+    DXGI_OUTPUT_DESC output_desc {};
+    display->output->GetDesc(&output_desc);
+
+    helper_ipc::init_message message {};
+    message.header = helper_ipc::make_header(helper_ipc::message_type::init, sizeof(message));
+    wcsncpy_s(message.display_name, output_desc.DeviceName, _TRUNCATE);
+    message.format = config.dynamicRange ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+    message.cursor_visible = !config.nativeCursor;
+    helper_cursor_visible = message.cursor_visible;
+
+    if (!write_exact(helper_pipe, &message, sizeof(message))) {
+      BOOST_LOG(warning) << "Failed to initialize WGC helper pipe"sv;
+      stop_helper();
+      return -1;
+    }
+
+    display->capture_format = message.format;
+    helper_device = display->device.get();
+    return 0;
+  }
+
   /**
    * This function runs in a separate thread spawned by the frame pool and is a producer of frames.
    * To maintain parity with the original display interface, this frame will be consumed by the capture thread.
@@ -188,6 +556,11 @@ namespace platf::dxgi {
    * @param out_time the timestamp of the frame just captured
    */
   capture_e wgc_capture_t::next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time) {
+    if (helper_active) {
+      release_frame();
+      return next_helper_frame(timeout, out, out_time);
+    }
+
     // this CONSUMER runs in the capture thread
     release_frame();
 
@@ -219,6 +592,26 @@ namespace platf::dxgi {
   }
 
   capture_e wgc_capture_t::release_frame() {
+    if (helper_active) {
+      if (helper_mutex && helper_frame_locked) {
+        const auto locked_handle = helper_remote_texture_handle;
+        if (FAILED(helper_mutex->ReleaseSync(0))) {
+          helper_frame_locked = false;
+          return capture_e::error;
+        }
+        helper_frame_locked = false;
+        if (helper_pipe && locked_handle) {
+          helper_ipc::frame_release_message message {};
+          message.header = helper_ipc::make_header(helper_ipc::message_type::frame_release, sizeof(message));
+          message.shared_handle = reinterpret_cast<std::uint64_t>(locked_handle);
+          if (!write_exact(helper_pipe, &message, sizeof(message))) {
+            return capture_e::error;
+          }
+        }
+      }
+      return capture_e::ok;
+    }
+
     if (consumed_frame != nullptr) {
       consumed_frame.Close();
       consumed_frame = nullptr;
@@ -226,7 +619,26 @@ namespace platf::dxgi {
     return capture_e::ok;
   }
 
+  bool wgc_capture_t::is_helper_active() const {
+    return helper_active;
+  }
+
   int wgc_capture_t::set_cursor_visible(bool x) {
+    if (helper_active) {
+      if (helper_cursor_visible == x || !helper_pipe) {
+        return 0;
+      }
+
+      helper_ipc::cursor_message message {};
+      message.header = helper_ipc::make_header(helper_ipc::message_type::cursor, sizeof(message));
+      message.cursor_visible = x;
+      if (!write_exact(helper_pipe, &message, sizeof(message))) {
+        return -1;
+      }
+      helper_cursor_visible = x;
+      return 0;
+    }
+
     try {
       if (capture_session.IsCursorCaptureEnabled() != x) {
         capture_session.IsCursorCaptureEnabled(x);
@@ -235,6 +647,143 @@ namespace platf::dxgi {
     } catch (winrt::hresult_error &) {
       return -1;
     }
+  }
+
+  capture_e wgc_capture_t::next_helper_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time) {
+    if (WaitForSingleObject(helper_process, 0) == WAIT_OBJECT_0) {
+      DWORD exit_code = 0;
+      GetExitCodeProcess(helper_process, &exit_code);
+      BOOST_LOG(warning) << "WGC helper exited [0x"sv << util::hex(exit_code).to_string_view() << ']';
+      return capture_e::error;
+    }
+
+    helper_ipc::message_header request = helper_ipc::make_header(helper_ipc::message_type::frame_request, sizeof(request));
+    if (!write_exact(helper_pipe, &request, sizeof(request))) {
+      return capture_e::error;
+    }
+
+    auto wait_time = timeout <= 0ms ? 25ms : timeout;
+    if (wait_time > 25ms) {
+      wait_time = 25ms;
+    }
+
+    helper_ipc::message_header header {};
+    switch (read_exact_timeout(helper_pipe, &header, sizeof(header), wait_time)) {
+      case pipe_read_e::ok:
+        break;
+      case pipe_read_e::timeout:
+        return capture_e::timeout;
+      case pipe_read_e::error:
+        return capture_e::error;
+    }
+
+    if (header.type == helper_ipc::message_type::error) {
+      helper_ipc::error_message message {};
+      message.header = header;
+      read_exact(helper_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header));
+      BOOST_LOG(warning) << "WGC helper reported an error [0x"sv << util::hex(message.code).to_string_view()
+                         << "] detail [0x"sv << util::hex(message.detail).to_string_view() << ']';
+      stop_helper();
+      return capture_e::error;
+    }
+
+    if (header.type != helper_ipc::message_type::frame || header.size != sizeof(helper_ipc::frame_message)) {
+      return capture_e::error;
+    }
+
+    helper_ipc::frame_message message {};
+    message.header = header;
+    switch (read_exact_timeout(helper_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header), wait_time)) {
+      case pipe_read_e::ok:
+        break;
+      case pipe_read_e::timeout:
+        return capture_e::timeout;
+      case pipe_read_e::error:
+        return capture_e::error;
+    }
+
+    if (helper_remote_texture_handle != reinterpret_cast<HANDLE>(message.shared_handle)) {
+      helper_texture.reset();
+      helper_mutex.reset();
+      helper_remote_texture_handle = nullptr;
+
+      HANDLE duplicated_handle {};
+      if (!helper_process ||
+          !DuplicateHandle(
+            helper_process,
+            reinterpret_cast<HANDLE>(message.shared_handle),
+            GetCurrentProcess(),
+            &duplicated_handle,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS
+          )) {
+        return capture_e::error;
+      }
+      helper_remote_texture_handle = reinterpret_cast<HANDLE>(message.shared_handle);
+
+      winrt::com_ptr<ID3D11Device1> device1;
+      winrt::com_ptr<ID3D11Resource> resource;
+      if (!helper_device ||
+          FAILED(helper_device->QueryInterface(IID_ID3D11Device1, device1.put_void())) ||
+          FAILED(device1->OpenSharedResource1(duplicated_handle, IID_ID3D11Resource, resource.put_void())) ||
+          FAILED(resource->QueryInterface(IID_ID3D11Texture2D, (void **) &helper_texture))) {
+        CloseHandle(duplicated_handle);
+        return capture_e::error;
+      }
+      CloseHandle(duplicated_handle);
+      if (FAILED(helper_texture->QueryInterface(IID_IDXGIKeyedMutex, (void **) &helper_mutex))) {
+        helper_texture.reset();
+        helper_mutex.reset();
+        return capture_e::error;
+      }
+    }
+
+    if (helper_mutex) {
+      const HRESULT acquire_status = helper_mutex->AcquireSync(1, 1000);
+      if (acquire_status == WAIT_TIMEOUT || acquire_status == HRESULT_FROM_WIN32(WAIT_TIMEOUT)) {
+        return capture_e::timeout;
+      }
+      if (FAILED(acquire_status)) {
+        return capture_e::error;
+      }
+    }
+    helper_frame_locked = helper_mutex != nullptr;
+    *out = helper_texture.get();
+    (*out)->AddRef();
+    out_time = message.qpc_timestamp;
+    return capture_e::ok;
+  }
+
+  void wgc_capture_t::stop_helper() {
+    if (helper_pipe) {
+      helper_ipc::message_header message = helper_ipc::make_header(helper_ipc::message_type::shutdown, sizeof(message));
+      write_exact(helper_pipe, &message, sizeof(message));
+      FlushFileBuffers(helper_pipe);
+      DisconnectNamedPipe(helper_pipe);
+      CloseHandle(helper_pipe);
+      helper_pipe = nullptr;
+    }
+
+    if (helper_process) {
+      if (WaitForSingleObject(helper_process, 1000) != WAIT_OBJECT_0) {
+        TerminateProcess(helper_process, ERROR_PROCESS_ABORTED);
+      }
+      CloseHandle(helper_process);
+      helper_process = nullptr;
+    }
+
+    if (helper_thread) {
+      CloseHandle(helper_thread);
+      helper_thread = nullptr;
+    }
+
+    helper_texture.reset();
+    helper_mutex.reset();
+    helper_texture_name.clear();
+    helper_remote_texture_handle = nullptr;
+    helper_device = nullptr;
+    helper_active = false;
   }
 
   int display_wgc_ram_t::init(const ::video::config_t &config, const std::string &display_name) {
@@ -294,19 +843,31 @@ namespace platf::dxgi {
     // mismatched image pool and desktop texture sizes. If this happens, just reinit again.
     if (desc.Width != width || desc.Height != height) {
       BOOST_LOG(info) << "Capture size changed ["sv << width << 'x' << height << " -> "sv << desc.Width << 'x' << desc.Height << ']';
+      if (dup.is_helper_active()) {
+        dup.release_frame();
+      }
       return capture_e::reinit;
     }
     // It's also possible for the capture format to change on the fly. If that happens,
     // reinitialize capture to try format detection again and create new images.
     if (capture_format != desc.Format) {
       BOOST_LOG(info) << "Capture format changed ["sv << dxgi_format_to_string(capture_format) << " -> "sv << dxgi_format_to_string(desc.Format) << ']';
+      if (dup.is_helper_active()) {
+        dup.release_frame();
+      }
       return capture_e::reinit;
     }
 
     // Copy from GPU to CPU
     device_ctx->CopyResource(texture.get(), src.get());
+    if (dup.is_helper_active()) {
+      dup.release_frame();
+    }
 
     if (!pull_free_image_cb(img_out)) {
+      if (dup.is_helper_active()) {
+        dup.release_frame();
+      }
       return capture_e::interrupted;
     }
     auto img = (img_t *) img_out.get();

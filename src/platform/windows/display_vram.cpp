@@ -1660,6 +1660,9 @@ namespace platf::dxgi {
     // mismatched image pool and desktop texture sizes. If this happens, just reinit again.
     if (desc.Width != width_before_rotation || desc.Height != height_before_rotation) {
       BOOST_LOG(info) << "Capture size changed ["sv << width << 'x' << height << " -> "sv << desc.Width << 'x' << desc.Height << ']';
+      if (dup.is_helper_active()) {
+        dup.release_frame();
+      }
       return capture_e::reinit;
     }
 
@@ -1667,11 +1670,17 @@ namespace platf::dxgi {
     // reinitialize capture to try format detection again and create new images.
     if (capture_format != desc.Format) {
       BOOST_LOG(info) << "Capture format changed ["sv << dxgi_format_to_string(capture_format) << " -> "sv << dxgi_format_to_string(desc.Format) << ']';
+      if (dup.is_helper_active()) {
+        dup.release_frame();
+      }
       return capture_e::reinit;
     }
 
     std::shared_ptr<platf::img_t> img;
     if (!pull_free_image_cb(img)) {
+      if (dup.is_helper_active()) {
+        dup.release_frame();
+      }
       return capture_e::interrupted;
     }
 
@@ -1681,11 +1690,17 @@ namespace platf::dxgi {
       texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
       if (lock_helper.lock()) {
         device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
+        if (dup.is_helper_active()) {
+          dup.release_frame();
+        }
       } else {
         BOOST_LOG(error) << "Failed to lock capture texture";
         return capture_e::error;
       }
     } else {
+      if (dup.is_helper_active()) {
+        dup.release_frame();
+      }
       return capture_e::error;
     }
     img_out = img;
