@@ -82,6 +82,13 @@ using namespace std::literals;
 
 namespace stream {
 
+  void write_le32(std::uint8_t *dst, std::uint32_t value) {
+    dst[0] = static_cast<std::uint8_t>(value & 0xFF);
+    dst[1] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
+    dst[2] = static_cast<std::uint8_t>((value >> 16) & 0xFF);
+    dst[3] = static_cast<std::uint8_t>((value >> 24) & 0xFF);
+  }
+
   enum class socket_e : int {
     video,  ///< Video
     audio  ///< Audio
@@ -430,6 +437,10 @@ namespace stream {
       std::uint16_t native_cursor_height {};
       std::uint16_t native_cursor_hotspot_x {};
       std::uint16_t native_cursor_hotspot_y {};
+      std::uint32_t native_cursor_scale_x {1u << 16};
+      std::uint32_t native_cursor_scale_y {1u << 16};
+      std::uint32_t native_cursor_sent_scale_x {};
+      std::uint32_t native_cursor_sent_scale_y {};
     } control;
 
     std::uint32_t launch_session_id;
@@ -1003,6 +1014,8 @@ namespace stream {
                                 session->control.native_cursor_hotspot_y != cursor_probe.hotspot_y);
     const bool state_changed = !session->control.native_cursor_sent ||
                                session->control.native_cursor_visible != cursor_probe.visible ||
+                               session->control.native_cursor_sent_scale_x != session->control.native_cursor_scale_x ||
+                               session->control.native_cursor_sent_scale_y != session->control.native_cursor_scale_y ||
                                shape_changed;
 
     if (!state_changed) {
@@ -1019,13 +1032,14 @@ namespace stream {
       cursor = std::move(*cursor_shape);
     }
 
+    constexpr std::uint32_t cursor_scale_payload_size = sizeof(std::uint32_t) * 2;
     const std::uint32_t image_size = shape_changed ? static_cast<std::uint32_t>(cursor.bgra.size()) : 0;
-    if (image_size > std::numeric_limits<std::uint16_t>::max() - sizeof(control_native_cursor_t)) {
+    if (image_size > std::numeric_limits<std::uint16_t>::max() - sizeof(control_native_cursor_t) - cursor_scale_payload_size) {
       BOOST_LOG(debug) << "Skipping oversized native cursor image ["sv << image_size << " bytes]"sv;
       return -1;
     }
 
-    std::vector<std::uint8_t> plaintext(sizeof(control_native_cursor_t) + image_size);
+    std::vector<std::uint8_t> plaintext(sizeof(control_native_cursor_t) + image_size + cursor_scale_payload_size);
     auto packet = (control_native_cursor_t *) plaintext.data();
     packet->header.type = packetTypes[IDX_NATIVE_CURSOR];
     packet->header.payloadLength = static_cast<std::uint16_t>(plaintext.size() - sizeof(control_header_v2));
@@ -1044,6 +1058,9 @@ namespace stream {
     if (image_size) {
       std::copy(cursor.bgra.begin(), cursor.bgra.end(), (std::uint8_t *) (packet + 1));
     }
+    auto cursor_scale = (std::uint8_t *) (packet + 1) + image_size;
+    write_le32(cursor_scale, session->control.native_cursor_scale_x);
+    write_le32(cursor_scale + sizeof(std::uint32_t), session->control.native_cursor_scale_y);
 
     std::vector<std::uint8_t> encrypted_payload;
     auto payload = encode_control(session, {(char *) plaintext.data(), plaintext.size()}, encrypted_payload);
@@ -1066,6 +1083,8 @@ namespace stream {
     session->control.native_cursor_height = cursor.visible ? cursor.height : 0;
     session->control.native_cursor_hotspot_x = cursor.visible ? cursor.hotspot_x : 0;
     session->control.native_cursor_hotspot_y = cursor.visible ? cursor.hotspot_y : 0;
+    session->control.native_cursor_sent_scale_x = session->control.native_cursor_scale_x;
+    session->control.native_cursor_sent_scale_y = session->control.native_cursor_scale_y;
     return 0;
   }
 
@@ -1279,6 +1298,16 @@ namespace stream {
             }
 
             if (session->config.nativeCursor) {
+              auto touch_port_event = session->mail->event<input::touch_port_t>(mail::touch_port);
+              if (touch_port_event->peek()) {
+                auto touch_port = touch_port_event->view();
+                if (touch_port && touch_port->scalar_inv > 0.0f) {
+                  auto fixed_scale = static_cast<std::uint32_t>((1.0f / touch_port->scalar_inv) * 65536.0f + 0.5f);
+                  session->control.native_cursor_scale_x = fixed_scale ? fixed_scale : 1;
+                  session->control.native_cursor_scale_y = fixed_scale ? fixed_scale : 1;
+                }
+              }
+
               has_native_cursor_session = true;
               if (!native_cursor) {
                 native_cursor = platf::probe_native_cursor();
