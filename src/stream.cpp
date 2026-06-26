@@ -51,6 +51,7 @@ constexpr int IDX_SET_MOTION_EVENT = 13;
 constexpr int IDX_SET_RGB_LED = 14;
 constexpr int IDX_SET_ADAPTIVE_TRIGGERS = 15;
 constexpr int IDX_NATIVE_CURSOR = 16;
+constexpr int IDX_CLIPBOARD = 17;
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -70,6 +71,7 @@ static const short packetTypes[] = {
   0x5502,  // Set RGB LED (Sunshine protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
   0x5504,  // Native cursor update (Sunshine protocol extension)
+  0x3001,  // Clipboard sync (Sunshine protocol extension)
 };
 
 namespace asio = boost::asio;
@@ -93,6 +95,26 @@ namespace stream {
     video,  ///< Video
     audio  ///< Audio
   };
+
+  namespace clipboard {
+    constexpr std::uint8_t VERSION = 1;
+
+    constexpr std::uint8_t OP_HELLO = 0x01;
+    constexpr std::uint8_t OP_SET = 0x02;
+    constexpr std::uint8_t OP_REQUEST = 0x03;
+    constexpr std::uint8_t OP_ACK = 0x04;
+    constexpr std::uint8_t OP_NACK = 0x05;
+
+    constexpr std::uint8_t MIME_TEXT_UTF8 = 0x01;
+
+    constexpr std::uint8_t FLAG_CAN_SEND = 0x01;
+    constexpr std::uint8_t FLAG_CAN_RECEIVE = 0x02;
+
+    constexpr std::uint32_t MAX_TEXT_BYTES = 1024 * 1024;
+    constexpr std::uint32_t MAX_CHUNK_BYTES = 60 * 1024;
+
+    constexpr std::chrono::milliseconds POLL_INTERVAL {500};
+  }  // namespace clipboard
 
 #pragma pack(push, 1)
 
@@ -236,6 +258,42 @@ namespace stream {
     boost::endian::little_uint16_at hotspotY;
     boost::endian::little_uint32_at shapeId;
     boost::endian::little_uint32_at imageSize;
+  };
+
+  struct control_clipboard_t {
+    control_header_v2 header;
+
+    std::uint8_t version;
+    std::uint8_t op;
+    std::uint8_t mimeType;
+    std::uint8_t flags;
+    boost::endian::little_uint32_at sequence;
+    boost::endian::little_uint32_at totalLength;
+    boost::endian::little_uint32_at chunkOffset;
+    boost::endian::little_uint32_at chunkLength;
+
+    std::uint8_t *data() {
+      return (std::uint8_t *) (this + 1);
+    }
+
+    const std::uint8_t *data() const {
+      return (const std::uint8_t *) (this + 1);
+    }
+  };
+
+  struct control_clipboard_payload_t {
+    std::uint8_t version;
+    std::uint8_t op;
+    std::uint8_t mimeType;
+    std::uint8_t flags;
+    boost::endian::little_uint32_at sequence;
+    boost::endian::little_uint32_at totalLength;
+    boost::endian::little_uint32_at chunkOffset;
+    boost::endian::little_uint32_at chunkLength;
+
+    const std::uint8_t *data() const {
+      return (const std::uint8_t *) (this + 1);
+    }
   };
 
   typedef struct control_encrypted_t {
@@ -441,6 +499,18 @@ namespace stream {
       std::uint32_t native_cursor_scale_y {1u << 16};
       std::uint32_t native_cursor_sent_scale_x {};
       std::uint32_t native_cursor_sent_scale_y {};
+
+      bool clipboard_negotiated {};
+      bool clipboard_client_can_send {};
+      bool clipboard_client_can_receive {};
+      std::uint32_t clipboard_next_sequence {1};
+      std::uint32_t clipboard_last_local_hash {};
+      std::uint32_t clipboard_last_remote_hash {};
+      std::uint32_t clipboard_recv_sequence {};
+      std::uint32_t clipboard_recv_total_length {};
+      std::uint32_t clipboard_recv_offset {};
+      std::string clipboard_recv_buffer;
+      std::chrono::steady_clock::time_point clipboard_next_poll {};
     } control;
 
     std::uint32_t launch_session_id;
@@ -856,6 +926,232 @@ namespace stream {
     return replaced;
   }
 
+  std::uint32_t clipboard_hash(std::string_view content) {
+    std::uint32_t hash = 2166136261u;
+    for (unsigned char byte : content) {
+      hash ^= byte;
+      hash *= 16777619u;
+    }
+    return hash ? hash : 1;
+  }
+
+  int send_clipboard_message(session_t *session, std::uint8_t op, std::uint8_t mime_type, std::uint8_t flags, std::uint32_t sequence, std::string_view content) {
+    if (!session->control.peer) {
+      return -1;
+    }
+
+    if (content.size() > clipboard::MAX_TEXT_BYTES) {
+      BOOST_LOG(debug) << "Skipping oversized clipboard payload ["sv << content.size() << " bytes]"sv;
+      return -1;
+    }
+
+    const std::uint32_t total_length = static_cast<std::uint32_t>(content.size());
+    const std::uint32_t chunk_size = std::max<std::uint32_t>(1, clipboard::MAX_CHUNK_BYTES);
+    for (std::uint32_t offset = 0; offset <= total_length; offset += chunk_size) {
+      const std::uint32_t remaining = total_length - offset;
+      const std::uint32_t current_chunk = total_length == 0 ? 0 : std::min(chunk_size, remaining);
+
+      std::vector<std::uint8_t> plaintext(sizeof(control_clipboard_t) + current_chunk);
+      auto packet = (control_clipboard_t *) plaintext.data();
+      packet->header.type = packetTypes[IDX_CLIPBOARD];
+      packet->header.payloadLength = static_cast<std::uint16_t>(plaintext.size() - sizeof(control_header_v2));
+      packet->version = clipboard::VERSION;
+      packet->op = op;
+      packet->mimeType = mime_type;
+      packet->flags = flags;
+      packet->sequence = sequence;
+      packet->totalLength = total_length;
+      packet->chunkOffset = offset;
+      packet->chunkLength = current_chunk;
+
+      if (current_chunk) {
+        std::copy_n(content.data() + offset, current_chunk, packet->data());
+      }
+
+      std::vector<std::uint8_t> encrypted_payload;
+      auto payload = encode_control(session, {(char *) plaintext.data(), plaintext.size()}, encrypted_payload);
+      if (payload.empty()) {
+        return -1;
+      }
+
+      if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+        TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
+        BOOST_LOG(warning) << "Couldn't send clipboard message to ["sv << addr << ':' << port << ']';
+        return -1;
+      }
+
+      if (total_length == 0 || current_chunk == remaining) {
+        break;
+      }
+    }
+
+    return 0;
+  }
+
+  int send_clipboard_hello(session_t *session) {
+    std::uint8_t flags = 0;
+    if (platf::supports_clipboard_text()) {
+      flags = clipboard::FLAG_CAN_SEND | clipboard::FLAG_CAN_RECEIVE;
+    }
+
+    return send_clipboard_message(
+      session,
+      clipboard::OP_HELLO,
+      clipboard::MIME_TEXT_UTF8,
+      flags,
+      session->control.clipboard_next_sequence++,
+      {}
+    );
+  }
+
+  int send_clipboard_set(session_t *session, std::string_view content) {
+    return send_clipboard_message(
+      session,
+      clipboard::OP_SET,
+      clipboard::MIME_TEXT_UTF8,
+      clipboard::FLAG_CAN_SEND | clipboard::FLAG_CAN_RECEIVE,
+      session->control.clipboard_next_sequence++,
+      content
+    );
+  }
+
+  void reset_clipboard_reassembly(session_t *session) {
+    session->control.clipboard_recv_sequence = 0;
+    session->control.clipboard_recv_total_length = 0;
+    session->control.clipboard_recv_offset = 0;
+    session->control.clipboard_recv_buffer.clear();
+  }
+
+  void handle_clipboard_message(session_t *session, const std::string_view &payload) {
+    if (payload.size() < sizeof(control_clipboard_payload_t)) {
+      BOOST_LOG(debug) << "Clipboard: runt packet"sv;
+      return;
+    }
+
+    auto packet = (const control_clipboard_payload_t *) payload.data();
+    const std::uint32_t sequence = packet->sequence;
+    const std::uint32_t total_length = packet->totalLength;
+    const std::uint32_t chunk_offset = packet->chunkOffset;
+    const std::uint32_t chunk_length = packet->chunkLength;
+
+    if (packet->version != clipboard::VERSION || packet->mimeType != clipboard::MIME_TEXT_UTF8) {
+      send_clipboard_message(session, clipboard::OP_NACK, clipboard::MIME_TEXT_UTF8, 0, sequence, {});
+      return;
+    }
+
+    if (total_length > clipboard::MAX_TEXT_BYTES || chunk_length > clipboard::MAX_CHUNK_BYTES ||
+        chunk_offset > total_length || chunk_length > total_length - chunk_offset ||
+        payload.size() != sizeof(control_clipboard_payload_t) + chunk_length) {
+      BOOST_LOG(debug) << "Clipboard: invalid packet bounds"sv;
+      reset_clipboard_reassembly(session);
+      send_clipboard_message(session, clipboard::OP_NACK, clipboard::MIME_TEXT_UTF8, 0, sequence, {});
+      return;
+    }
+
+    switch (packet->op) {
+      case clipboard::OP_HELLO:
+        session->control.clipboard_negotiated = true;
+        session->control.clipboard_client_can_send = (packet->flags & clipboard::FLAG_CAN_SEND) != 0;
+        session->control.clipboard_client_can_receive = (packet->flags & clipboard::FLAG_CAN_RECEIVE) != 0;
+        send_clipboard_hello(session);
+        break;
+
+      case clipboard::OP_REQUEST:
+        {
+          if (!session->control.clipboard_negotiated || !session->control.clipboard_client_can_receive || !platf::supports_clipboard_text()) {
+            send_clipboard_message(session, clipboard::OP_NACK, clipboard::MIME_TEXT_UTF8, 0, sequence, {});
+            return;
+          }
+
+          std::string content;
+          if (!platf::get_clipboard_text(content)) {
+            send_clipboard_message(session, clipboard::OP_NACK, clipboard::MIME_TEXT_UTF8, 0, sequence, {});
+            return;
+          }
+
+          session->control.clipboard_last_local_hash = clipboard_hash(content);
+          send_clipboard_set(session, content);
+        }
+        break;
+
+      case clipboard::OP_SET:
+        if (!session->control.clipboard_negotiated || !session->control.clipboard_client_can_send || !platf::supports_clipboard_text()) {
+          send_clipboard_message(session, clipboard::OP_NACK, clipboard::MIME_TEXT_UTF8, 0, sequence, {});
+          return;
+        }
+
+        if (chunk_offset == 0) {
+          reset_clipboard_reassembly(session);
+          session->control.clipboard_recv_sequence = sequence;
+          session->control.clipboard_recv_total_length = total_length;
+          session->control.clipboard_recv_buffer.resize(total_length);
+        }
+
+        if (session->control.clipboard_recv_sequence != sequence ||
+            session->control.clipboard_recv_total_length != total_length ||
+            session->control.clipboard_recv_offset != chunk_offset) {
+          reset_clipboard_reassembly(session);
+          send_clipboard_message(session, clipboard::OP_NACK, clipboard::MIME_TEXT_UTF8, 0, sequence, {});
+          return;
+        }
+
+        if (chunk_length) {
+          std::copy_n((const char *) packet->data(), chunk_length, session->control.clipboard_recv_buffer.data() + chunk_offset);
+        }
+        session->control.clipboard_recv_offset = chunk_offset + chunk_length;
+
+        if (chunk_offset + chunk_length == total_length) {
+          auto content = std::move(session->control.clipboard_recv_buffer);
+          reset_clipboard_reassembly(session);
+
+          const auto hash = clipboard_hash(content);
+          session->control.clipboard_last_remote_hash = hash;
+          if (hash != session->control.clipboard_last_local_hash) {
+            if (!platf::set_clipboard_text(content)) {
+              send_clipboard_message(session, clipboard::OP_NACK, clipboard::MIME_TEXT_UTF8, 0, sequence, {});
+              return;
+            }
+            session->control.clipboard_last_local_hash = hash;
+          }
+
+          send_clipboard_message(session, clipboard::OP_ACK, clipboard::MIME_TEXT_UTF8, 0, sequence, {});
+        }
+        break;
+
+      case clipboard::OP_ACK:
+      case clipboard::OP_NACK:
+        break;
+
+      default:
+        send_clipboard_message(session, clipboard::OP_NACK, clipboard::MIME_TEXT_UTF8, 0, sequence, {});
+        break;
+    }
+  }
+
+  void poll_clipboard(session_t *session, std::chrono::steady_clock::time_point now) {
+    if (!session->control.clipboard_negotiated || !session->control.clipboard_client_can_receive || !platf::supports_clipboard_text()) {
+      return;
+    }
+
+    if (now < session->control.clipboard_next_poll) {
+      return;
+    }
+    session->control.clipboard_next_poll = now + clipboard::POLL_INTERVAL;
+
+    std::string content;
+    if (!platf::get_clipboard_text(content) || content.size() > clipboard::MAX_TEXT_BYTES) {
+      return;
+    }
+
+    const auto hash = clipboard_hash(content);
+    if (hash == session->control.clipboard_last_local_hash || hash == session->control.clipboard_last_remote_hash) {
+      return;
+    }
+
+    session->control.clipboard_last_local_hash = hash;
+    send_clipboard_set(session, content);
+  }
+
   /**
    * @brief Pass gamepad feedback data back to the client.
    * @param session The session object.
@@ -1136,6 +1432,11 @@ namespace stream {
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
     });
 
+    server->map(packetTypes[IDX_CLIPBOARD], [&](session_t *session, const std::string_view &payload) {
+      BOOST_LOG(debug) << "type [IDX_CLIPBOARD]"sv;
+      handle_clipboard_message(session, payload);
+    });
+
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_INPUT_DATA]"sv;
 
@@ -1296,6 +1597,8 @@ namespace stream {
 
               send_hdr_mode(session, std::move(hdr_info));
             }
+
+            poll_clipboard(session, now);
 
             if (session->config.nativeCursor) {
               auto touch_port_event = session->mail->event<input::touch_port_t>(mail::touch_port);

@@ -915,6 +915,26 @@ namespace platf {
   std::unique_ptr<high_precision_timer> create_high_precision_timer();
 
   /**
+   * @brief Check whether the platform backend supports text clipboard access.
+   * @return `true` if get_clipboard_text() and set_clipboard_text() are available.
+   */
+  bool supports_clipboard_text();
+
+  /**
+   * @brief Read the current host clipboard as UTF-8 text.
+   * @param content Receives the clipboard contents.
+   * @return `true` when text was read successfully, `false` if unavailable or unsupported.
+   */
+  bool get_clipboard_text(std::string &content);
+
+  /**
+   * @brief Set the host clipboard to UTF-8 text.
+   * @param content Clipboard contents.
+   * @return `true` when the clipboard was written successfully, `false` if unavailable or unsupported.
+   */
+  bool set_clipboard_text(const std::string &content);
+
+  /**
    * @brief Check is the current process is running with elevated privileges (e.g. system admin/etc.)
    * @param all_caps Bool that specifies whether to check all caps or only CAP_SYS_ADMIN
    * @return True if capabilities specified to be checked are present.

@@ -1239,6 +1239,20 @@ namespace platf {
     return std::make_unique<linux_high_precision_timer>();
   }
 
+  bool supports_clipboard_text() {
+    return false;
+  }
+
+  bool get_clipboard_text(std::string &content) {
+    content.clear();
+    return false;
+  }
+
+  bool set_clipboard_text(const std::string &content) {
+    (void) content;
+    return false;
+  }
+
   std::string find_render_node_with_display() {
 #ifdef SUNSHINE_BUILD_DRM
     auto *dir = opendir("/dev/dri");

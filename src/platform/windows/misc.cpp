@@ -1928,6 +1928,84 @@ namespace platf {
     return std::make_unique<win32_high_precision_timer>();
   }
 
+  bool supports_clipboard_text() {
+    return true;
+  }
+
+  bool get_clipboard_text(std::string &content) {
+    content.clear();
+
+    if (!OpenClipboard(nullptr)) {
+      BOOST_LOG(debug) << "Failed to open clipboard for reading";
+      return false;
+    }
+
+    auto close_clipboard = util::fail_guard([]() {
+      CloseClipboard();
+    });
+
+    HANDLE data = GetClipboardData(CF_UNICODETEXT);
+    if (!data) {
+      return false;
+    }
+
+    auto text = static_cast<const wchar_t *>(GlobalLock(data));
+    if (!text) {
+      BOOST_LOG(debug) << "Failed to lock clipboard data";
+      return false;
+    }
+
+    auto unlock_data = util::fail_guard([data]() {
+      GlobalUnlock(data);
+    });
+
+    content = utf_utils::to_utf8(text);
+    return true;
+  }
+
+  bool set_clipboard_text(const std::string &content) {
+    auto wide = utf_utils::from_utf8(content);
+
+    if (!OpenClipboard(nullptr)) {
+      BOOST_LOG(debug) << "Failed to open clipboard for writing";
+      return false;
+    }
+
+    auto close_clipboard = util::fail_guard([]() {
+      CloseClipboard();
+    });
+
+    if (!EmptyClipboard()) {
+      BOOST_LOG(warning) << "Failed to empty clipboard";
+      return false;
+    }
+
+    const auto bytes = (wide.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!memory) {
+      BOOST_LOG(warning) << "Failed to allocate clipboard memory";
+      return false;
+    }
+
+    auto text = static_cast<wchar_t *>(GlobalLock(memory));
+    if (!text) {
+      BOOST_LOG(warning) << "Failed to lock clipboard memory";
+      GlobalFree(memory);
+      return false;
+    }
+
+    memcpy(text, wide.c_str(), bytes);
+    GlobalUnlock(memory);
+
+    if (!SetClipboardData(CF_UNICODETEXT, memory)) {
+      BOOST_LOG(warning) << "Failed to set clipboard data";
+      GlobalFree(memory);
+      return false;
+    }
+
+    return true;
+  }
+
   bool getFileVersionInfo(const std::filesystem::path &file_path, std::string &version_str) {
     DWORD handle = 0;
     DWORD size = GetFileVersionInfoSizeW(file_path.wstring().c_str(), &handle);
