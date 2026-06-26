@@ -47,3 +47,13 @@ target_link_libraries(sunshinesvc
         wtsapi32
         ${PLATFORM_LIBRARIES})
 target_compile_options(sunshinesvc PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+add_executable(sunshine-wgc-helper wgc_helper.cpp)
+target_link_libraries(sunshine-wgc-helper
+        ${CMAKE_THREAD_LIBS_INIT}
+        d3d11
+        dxgi
+        runtimeobject
+        Windowsapp
+        ${PLATFORM_LIBRARIES})
+target_compile_options(sunshine-wgc-helper PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
