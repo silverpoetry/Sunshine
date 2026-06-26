@@ -583,7 +583,7 @@ namespace config {
     true,  // always send scancodes
     true,  // high resolution scrolling
     true,  // native pen/touch support
-    false,  // native cursor support
+    true,  // native cursor support
   };
 
   sunshine_t sunshine {
