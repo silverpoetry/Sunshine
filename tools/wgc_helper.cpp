@@ -315,7 +315,7 @@ namespace {
       }
     };
 
-    std::array<frame_slot, 2> slots;
+    std::array<frame_slot, 1> slots;
     int latest_slot = -1;
     std::uint64_t next_sequence = 1;
     std::uint64_t last_sent_sequence = 0;
@@ -646,33 +646,12 @@ namespace {
     }
 
     int select_writable_slot_locked() {
-      const auto writable = [&](int slot_index) {
-        const auto &slot = slots[slot_index];
-        return !slot.in_flight &&
-               !slot.writing &&
-               (!slot.texture || slot.mutex);
-      };
-
-      // Prefer the non-latest slot to avoid overwriting a frame that is ready for the main process.
-      // If that slot is still in-flight, overwrite latest instead. A ready-but-unsent frame is only
-      // a mailbox value; keeping it must never block newer WGC frames from replacing it.
-      if (latest_slot >= 0) {
-        const int other = 1 - latest_slot;
-        if (writable(other)) {
-          return other;
-        }
-        if (writable(latest_slot)) {
-          return latest_slot;
-        }
-        return -1;
-      }
-
-      for (int i = 0; i < static_cast<int>(slots.size()); ++i) {
-        if (writable(i)) {
-          return i;
-        }
-      }
-      return -1;
+      const auto &slot = slots[0];
+      return !slot.in_flight &&
+                 !slot.writing &&
+                 (!slot.texture || slot.mutex) ?
+               0 :
+               -1;
     }
 
     void capture_loop() {
@@ -731,22 +710,22 @@ namespace {
 
         int slot_index = -1;
         {
-          std::lock_guard lock {state_mutex};
+          std::unique_lock lock {state_mutex};
+          if (select_writable_slot_locked() < 0) {
+            slot_waits.fetch_add(1, std::memory_order_relaxed);
+            state_cv.wait(lock, [&]() {
+              return stopping || fatal_error || select_writable_slot_locked() >= 0;
+            });
+          }
+          if (stopping || fatal_error) {
+            return;
+          }
           slot_index = select_writable_slot_locked();
           if (slot_index < 0) {
-            slot_waits.fetch_add(1, std::memory_order_relaxed);
-          } else {
-            slots[slot_index].writing = true;
-            slots[slot_index].ready = false;
+            continue;
           }
-        }
-        if (stopping || fatal_error) {
-          return;
-        }
-        if (slot_index < 0) {
-          // Never hold a WGC frame while waiting for the encoder side to release a shared slot.
-          // Dropping here lets the next loop drain the frame pool and copy the newest frame instead.
-          continue;
+          slots[slot_index].writing = true;
+          slots[slot_index].ready = false;
         }
 
         auto access = newest_frame.Surface().as<winrt::IDirect3DDxgiInterfaceAccess>();
@@ -865,9 +844,17 @@ namespace {
           send_error(pipe, fatal_code, fatal_detail);
           return false;
         }
-        if (fatal_error) {
-          send_error(pipe, fatal_code, fatal_detail);
-          return false;
+        if (slots[0].writing) {
+          state_cv.wait(lock, [&]() {
+            return stopping || fatal_error || !slots[0].writing;
+          });
+          if (fatal_error) {
+            send_error(pipe, fatal_code, fatal_detail);
+            return false;
+          }
+          if (stopping) {
+            return false;
+          }
         }
         if (!frame_available_locked()) {
           lock.unlock();

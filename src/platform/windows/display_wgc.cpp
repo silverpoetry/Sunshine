@@ -314,10 +314,15 @@ namespace platf::dxgi {
    * @return 0 on success, -1 on failure.
    */
   int wgc_capture_t::init(display_base_t *display, const ::video::config_t &config) {
-    if (is_local_system_process() && init_helper(display, config) == 0) {
-      helper_active = true;
-      BOOST_LOG(info) << "Using user-session WGC helper for service-hosted capture"sv;
-      return 0;
+    const bool service_context = is_local_system_process();
+    BOOST_LOG(warning) << "Initializing WGC capture [service_context=" << service_context << ']';
+    if (service_context) {
+      if (init_helper(display, config) == 0) {
+        helper_active = true;
+        BOOST_LOG(warning) << "Using user-session WGC helper for service-hosted capture"sv;
+        return 0;
+      }
+      BOOST_LOG(warning) << "WGC helper initialization failed; trying in-process WGC capture"sv;
     }
 
     HRESULT status;
@@ -423,6 +428,7 @@ namespace platf::dxgi {
       BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to start capture: [0x"sv << util::hex(e.code()).to_string_view() << ']';
       return -1;
     }
+    BOOST_LOG(warning) << "Using in-process WGC capture"sv;
     return 0;
   }
 

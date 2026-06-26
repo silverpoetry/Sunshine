@@ -1005,19 +1005,28 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    BOOST_LOG(warning) << "Selecting Windows capture backend [requested="
+                       << (config::video.capture.empty() ? "auto" : config::video.capture)
+                       << ", memory=" << (hwdevice_type == mem_type_e::dxgi ? "dxgi" : "system")
+                       << ", display=" << display_name << ']';
+
     if (config::video.capture == "ddx" || config::video.capture.empty()) {
       if (hwdevice_type == mem_type_e::dxgi) {
         auto disp = std::make_shared<dxgi::display_ddup_vram_t>();
 
         if (!disp->init(config, display_name)) {
+          BOOST_LOG(warning) << "Using Windows DDAPI capture backend";
           return disp;
         }
+        BOOST_LOG(warning) << "Windows DDAPI capture backend initialization failed";
       } else if (hwdevice_type == mem_type_e::system) {
         auto disp = std::make_shared<dxgi::display_ddup_ram_t>();
 
         if (!disp->init(config, display_name)) {
+          BOOST_LOG(warning) << "Using Windows DDAPI capture backend";
           return disp;
         }
+        BOOST_LOG(warning) << "Windows DDAPI capture backend initialization failed";
       }
     }
 
@@ -1026,14 +1035,18 @@ namespace platf {
         auto disp = std::make_shared<dxgi::display_wgc_vram_t>();
 
         if (!disp->init(config, display_name)) {
+          BOOST_LOG(warning) << "Using Windows WGC capture backend";
           return disp;
         }
+        BOOST_LOG(warning) << "Windows WGC capture backend initialization failed";
       } else if (hwdevice_type == mem_type_e::system) {
         auto disp = std::make_shared<dxgi::display_wgc_ram_t>();
 
         if (!disp->init(config, display_name)) {
+          BOOST_LOG(warning) << "Using Windows WGC capture backend";
           return disp;
         }
+        BOOST_LOG(warning) << "Windows WGC capture backend initialization failed";
       }
     }
 
