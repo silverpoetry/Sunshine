@@ -47,6 +47,18 @@ else()
                 RESULT_VARIABLE GIT_DESCRIBE_ERROR_CODE
                 OUTPUT_STRIP_TRAILING_WHITESPACE
         )
+        execute_process(
+                COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+                OUTPUT_VARIABLE GIT_FULL_COMMIT
+                RESULT_VARIABLE GIT_COMMIT_ERROR_CODE
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        execute_process(
+                COMMAND ${GIT_EXECUTABLE} describe --tags --always --dirty
+                OUTPUT_VARIABLE GIT_TAGGED_VERSION
+                RESULT_VARIABLE GIT_TAGGED_VERSION_ERROR_CODE
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
         # Check if Dirty
         execute_process(
                 COMMAND ${GIT_EXECUTABLE} diff --quiet --exit-code
@@ -55,11 +67,19 @@ else()
         )
         if(NOT GIT_DESCRIBE_ERROR_CODE)
             MESSAGE("Sunshine Branch: ${GIT_DESCRIBE_BRANCH}")
-            if(NOT GIT_DESCRIBE_BRANCH STREQUAL "master")
+            if(NOT GIT_TAGGED_VERSION_ERROR_CODE)
+                set(PROJECT_VERSION ${GIT_TAGGED_VERSION})
+                string(REGEX REPLACE "^v" "" PROJECT_VERSION ${PROJECT_VERSION})  # remove the v prefix if it exists
+                set(CMAKE_PROJECT_VERSION ${PROJECT_VERSION})  # cpack will use this to set the binary versions
+                MESSAGE("Sunshine Version: ${PROJECT_VERSION}")
+            elseif(NOT GIT_DESCRIBE_BRANCH STREQUAL "master")
                 set(PROJECT_VERSION ${PROJECT_VERSION}-${GIT_DESCRIBE_VERSION})
-                MESSAGE("Sunshine Version: ${GIT_DESCRIBE_VERSION}")
+                MESSAGE("Sunshine Version: ${PROJECT_VERSION}")
             endif()
-            if(GIT_IS_DIRTY)
+            if((NOT GIT_COMMIT_ERROR_CODE) AND ((NOT DEFINED GITHUB_COMMIT) OR GITHUB_COMMIT STREQUAL ""))
+                set(GITHUB_COMMIT ${GIT_FULL_COMMIT})
+            endif()
+            if(GIT_IS_DIRTY AND GIT_TAGGED_VERSION_ERROR_CODE)
                 set(PROJECT_VERSION ${PROJECT_VERSION}-dirty)
                 MESSAGE("Git tree is dirty!")
             endif()
@@ -78,7 +98,7 @@ set(PROJECT_DAY "01")
 
 # Extract year, month, and day (do this AFTER version parsing)
 # Note: Cmake doesn't support "{}" regex syntax
-if(PROJECT_VERSION MATCHES "^([0-9][0-9][0-9][0-9])\\.([0-9][0-9][0-9][0-9]?)\\.([0-9]+)$")
+if(PROJECT_VERSION MATCHES "^([0-9][0-9][0-9][0-9])\\.([0-9][0-9][0-9][0-9]?)\\.([0-9]+)")
     message("Extracting year and month/day from PROJECT_VERSION: ${PROJECT_VERSION}")
     # First capture group is the year
     set(PROJECT_YEAR "${CMAKE_MATCH_1}")
