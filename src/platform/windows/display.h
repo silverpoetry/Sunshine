@@ -357,6 +357,7 @@ namespace platf::dxgi {
     SRWLOCK frame_lock = SRWLOCK_INIT;
     CONDITION_VARIABLE frame_present_cv;
     HANDLE helper_pipe {};
+    HANDLE helper_reply_pipe {};
     HANDLE helper_process {};
     HANDLE helper_thread {};
     ID3D11Device *helper_device {};

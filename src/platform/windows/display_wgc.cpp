@@ -4,7 +4,6 @@
  */
 // standard includes
 #include <algorithm>
-#include <filesystem>
 #include <thread>
 #include <vector>
 
@@ -216,16 +215,6 @@ namespace platf::dxgi {
       return path;
     }
 
-    std::wstring helper_log_path() {
-      wchar_t module_path[MAX_PATH];
-      GetModuleFileNameW(nullptr, module_path, _countof(module_path));
-      std::filesystem::path path {module_path};
-      path = path.parent_path() / L"config" / L"wgc-helper.log";
-      std::error_code ec;
-      std::filesystem::create_directories(path.parent_path(), ec);
-      return path.wstring();
-    }
-
     bool connect_pipe_with_timeout(HANDLE pipe, std::chrono::milliseconds timeout) {
       OVERLAPPED overlapped {};
       overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -315,11 +304,9 @@ namespace platf::dxgi {
    */
   int wgc_capture_t::init(display_base_t *display, const ::video::config_t &config) {
     const bool service_context = is_local_system_process();
-    BOOST_LOG(warning) << "Initializing WGC capture [service_context=" << service_context << ']';
     if (service_context) {
       if (init_helper(display, config) == 0) {
         helper_active = true;
-        BOOST_LOG(warning) << "Using user-session WGC helper for service-hosted capture"sv;
         return 0;
       }
       BOOST_LOG(warning) << "WGC helper initialization failed; trying in-process WGC capture"sv;
@@ -428,12 +415,12 @@ namespace platf::dxgi {
       BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows: failed to start capture: [0x"sv << util::hex(e.code()).to_string_view() << ']';
       return -1;
     }
-    BOOST_LOG(warning) << "Using in-process WGC capture"sv;
     return 0;
   }
 
   int wgc_capture_t::init_helper(display_base_t *display, const ::video::config_t &config) {
     auto pipe_name = std::wstring {L"\\\\.\\pipe\\SunshineWgcHelper-"} + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+    auto reply_pipe_name = pipe_name + L"-Reply";
     PSECURITY_DESCRIPTOR pipe_sd {};
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
           L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)(A;;GA;;;AU)",
@@ -454,7 +441,7 @@ namespace platf::dxgi {
 
     helper_pipe = CreateNamedPipeW(
       pipe_name.c_str(),
-      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+      PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
       1,
       1024 * 1024,
@@ -464,6 +451,22 @@ namespace platf::dxgi {
     );
     if (!helper_pipe || helper_pipe == INVALID_HANDLE_VALUE) {
       helper_pipe = nullptr;
+      return -1;
+    }
+
+    helper_reply_pipe = CreateNamedPipeW(
+      reply_pipe_name.c_str(),
+      PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+      1,
+      1024 * 1024,
+      1024 * 1024,
+      0,
+      &pipe_security
+    );
+    if (!helper_reply_pipe || helper_reply_pipe == INVALID_HANDLE_VALUE) {
+      helper_reply_pipe = nullptr;
+      stop_helper();
       return -1;
     }
 
@@ -486,8 +489,7 @@ namespace platf::dxgi {
     });
 
     auto exe = helper_path();
-    auto log_path = helper_log_path();
-    auto command = L"\""s + exe + L"\" --pipe \"" + pipe_name + L"\" --log \"" + log_path + L"\"";
+    auto command = L"\""s + exe + L"\" --pipe \"" + pipe_name + L"\" --reply-pipe \"" + reply_pipe_name + L"\"";
 
     STARTUPINFOW startup_info {};
     startup_info.cb = sizeof(startup_info);
@@ -517,6 +519,11 @@ namespace platf::dxgi {
 
     if (!connect_pipe_with_timeout(helper_pipe, 5s)) {
       BOOST_LOG(warning) << "WGC helper did not connect to the pipe in time; helper is "sv << helper_exit_status(helper_process);
+      stop_helper();
+      return -1;
+    }
+    if (!connect_pipe_with_timeout(helper_reply_pipe, 5s)) {
+      BOOST_LOG(warning) << "WGC helper did not connect to the reply pipe in time; helper is "sv << helper_exit_status(helper_process);
       stop_helper();
       return -1;
     }
@@ -683,15 +690,13 @@ namespace platf::dxgi {
 
     helper_ipc::frame_request_message request {};
     request.header = helper_ipc::make_header(helper_ipc::message_type::frame_request, sizeof(request));
-    // The helper owns a mailbox of already-captured frames. Requests must be
-    // non-blocking so frame release messages are never stuck behind a wait.
-    request.timeout_ms = 0;
+    request.timeout_ms = static_cast<std::uint32_t>(std::max(timeout.count(), 0ll));
     request.request_id = ++helper_next_request_id;
     if (!write_exact(helper_pipe, &request, sizeof(request))) {
       return capture_e::error;
     }
 
-    auto wait_time = 50ms;
+    auto wait_time = std::max(50ms, timeout + 50ms);
 
     auto ensure_helper_texture = [&](const helper_ipc::frame_message &message) -> bool {
       if (helper_remote_texture_handle == reinterpret_cast<HANDLE>(message.shared_handle)) {
@@ -748,7 +753,7 @@ namespace platf::dxgi {
 
     while (true) {
       helper_ipc::message_header header {};
-      switch (read_exact_timeout(helper_pipe, &header, sizeof(header), wait_time)) {
+      switch (read_exact_timeout(helper_reply_pipe, &header, sizeof(header), wait_time)) {
         case pipe_read_e::ok:
           break;
         case pipe_read_e::timeout:
@@ -760,7 +765,7 @@ namespace platf::dxgi {
       if (header.type == helper_ipc::message_type::no_frame && header.size == sizeof(helper_ipc::no_frame_message)) {
         helper_ipc::no_frame_message message {};
         message.header = header;
-        switch (read_exact_timeout(helper_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header), wait_time)) {
+        switch (read_exact_timeout(helper_reply_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header), wait_time)) {
           case pipe_read_e::ok:
             break;
           case pipe_read_e::timeout:
@@ -777,7 +782,7 @@ namespace platf::dxgi {
       if (header.type == helper_ipc::message_type::error) {
         helper_ipc::error_message message {};
         message.header = header;
-        read_exact(helper_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header));
+        read_exact(helper_reply_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header));
         BOOST_LOG(warning) << "WGC helper reported an error [0x"sv << util::hex(message.code).to_string_view()
                            << "] detail [0x"sv << util::hex(message.detail).to_string_view() << ']';
         stop_helper();
@@ -790,7 +795,7 @@ namespace platf::dxgi {
 
       helper_ipc::frame_message message {};
       message.header = header;
-      switch (read_exact_timeout(helper_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header), wait_time)) {
+      switch (read_exact_timeout(helper_reply_pipe, reinterpret_cast<std::uint8_t *>(&message) + sizeof(header), sizeof(message) - sizeof(header), wait_time)) {
         case pipe_read_e::ok:
           break;
         case pipe_read_e::timeout:
@@ -839,6 +844,12 @@ namespace platf::dxgi {
       DisconnectNamedPipe(helper_pipe);
       CloseHandle(helper_pipe);
       helper_pipe = nullptr;
+    }
+
+    if (helper_reply_pipe) {
+      DisconnectNamedPipe(helper_reply_pipe);
+      CloseHandle(helper_reply_pipe);
+      helper_reply_pipe = nullptr;
     }
 
     if (helper_process) {
