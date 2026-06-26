@@ -59,12 +59,6 @@ else()
                 RESULT_VARIABLE GIT_TAGGED_VERSION_ERROR_CODE
                 OUTPUT_STRIP_TRAILING_WHITESPACE
         )
-        # Check if Dirty
-        execute_process(
-                COMMAND ${GIT_EXECUTABLE} diff --quiet --exit-code
-                RESULT_VARIABLE GIT_IS_DIRTY
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
         if(NOT GIT_DESCRIBE_ERROR_CODE)
             MESSAGE("Sunshine Branch: ${GIT_DESCRIBE_BRANCH}")
             if(NOT GIT_TAGGED_VERSION_ERROR_CODE)
@@ -78,10 +72,6 @@ else()
             endif()
             if((NOT GIT_COMMIT_ERROR_CODE) AND ((NOT DEFINED GITHUB_COMMIT) OR GITHUB_COMMIT STREQUAL ""))
                 set(GITHUB_COMMIT ${GIT_FULL_COMMIT})
-            endif()
-            if(GIT_IS_DIRTY)
-                set(PROJECT_VERSION ${PROJECT_VERSION}-dirty)
-                MESSAGE("Git tree is dirty!")
             endif()
         else()
             MESSAGE(ERROR ": Got git error while fetching tags: ${GIT_DESCRIBE_ERROR_CODE}")
