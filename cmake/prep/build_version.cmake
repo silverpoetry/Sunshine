@@ -54,7 +54,7 @@ else()
                 OUTPUT_STRIP_TRAILING_WHITESPACE
         )
         execute_process(
-                COMMAND ${GIT_EXECUTABLE} describe --tags --always --dirty
+                COMMAND ${GIT_EXECUTABLE} describe --tags --always
                 OUTPUT_VARIABLE GIT_TAGGED_VERSION
                 RESULT_VARIABLE GIT_TAGGED_VERSION_ERROR_CODE
                 OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -79,7 +79,7 @@ else()
             if((NOT GIT_COMMIT_ERROR_CODE) AND ((NOT DEFINED GITHUB_COMMIT) OR GITHUB_COMMIT STREQUAL ""))
                 set(GITHUB_COMMIT ${GIT_FULL_COMMIT})
             endif()
-            if(GIT_IS_DIRTY AND GIT_TAGGED_VERSION_ERROR_CODE)
+            if(GIT_IS_DIRTY)
                 set(PROJECT_VERSION ${PROJECT_VERSION}-dirty)
                 MESSAGE("Git tree is dirty!")
             endif()
