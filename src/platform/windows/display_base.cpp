@@ -439,7 +439,7 @@ namespace platf::dxgi {
     }
   }
 
-  int display_base_t::init(const ::video::config_t &config, const std::string &display_name) {
+  int display_base_t::init(const ::video::config_t &config, const std::string &display_name, bool validate_dxgi_duplication) {
     std::once_flag windows_cpp_once_flag;
 
     std::call_once(windows_cpp_once_flag, []() {
@@ -503,7 +503,7 @@ namespace platf::dxgi {
             continue;
           }
 
-          if (desc.AttachedToDesktop && test_dxgi_duplication(adapter_tmp, output_tmp, false)) {
+          if (desc.AttachedToDesktop && (!validate_dxgi_duplication || test_dxgi_duplication(adapter_tmp, output_tmp, false))) {
             output = std::move(output_tmp);
 
             offset_x = desc.DesktopCoordinates.left;
@@ -1048,12 +1048,15 @@ namespace platf {
 
     BOOST_LOG(debug) << "Detecting monitors..."sv;
 
-    // We sync the thread desktop once before we start the enumeration process
-    // to ensure test_dxgi_duplication() returns consistent results for all GPUs
-    // even if the current desktop changes during our enumeration process.
-    // It is critical that we either fully succeed in enumeration or fully fail,
-    // otherwise it can lead to the capture code switching monitors unexpectedly.
-    syncThreadDesktop();
+    const bool validate_dxgi_duplication = config::video.capture != "wgc";
+    if (validate_dxgi_duplication) {
+      // We sync the thread desktop once before we start the enumeration process
+      // to ensure test_dxgi_duplication() returns consistent results for all GPUs
+      // even if the current desktop changes during our enumeration process.
+      // It is critical that we either fully succeed in enumeration or fully fail,
+      // otherwise it can lead to the capture code switching monitors unexpectedly.
+      syncThreadDesktop();
+    }
 
     dxgi::factory1_t factory;
     status = CreateDXGIFactory1(IID_IDXGIFactory1, (void **) &factory);
@@ -1098,8 +1101,9 @@ namespace platf {
           << "    Resolution        : "sv << width << 'x' << height << std::endl
           << std::endl;
 
-        // Don't include the display in the list if we can't actually capture it
-        if (desc.AttachedToDesktop && dxgi::test_dxgi_duplication(adapter, output, true)) {
+        // WGC does not rely on Desktop Duplication, so avoid a redundant
+        // DuplicateOutput() probe on WGC-only startup.
+        if (desc.AttachedToDesktop && (!validate_dxgi_duplication || dxgi::test_dxgi_duplication(adapter, output, true))) {
           display_names.emplace_back(std::move(device_name));
         }
       }

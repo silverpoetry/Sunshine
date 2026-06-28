@@ -874,7 +874,7 @@ namespace platf::dxgi {
   }
 
   int display_wgc_ram_t::init(const ::video::config_t &config, const std::string &display_name) {
-    if (display_base_t::init(config, display_name) || dup.init(this, config)) {
+    if (display_base_t::init(config, display_name, false) || dup.init(this, config)) {
       return -1;
     }
 
