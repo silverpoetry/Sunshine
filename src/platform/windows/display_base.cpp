@@ -1123,13 +1123,22 @@ namespace platf {
 
     // Keep a reference to the DXGI factory, which will keep track of changes internally.
     static dxgi::factory1_t factory;
+    static bool initialized = false;
     if (!factory || !factory->IsCurrent()) {
+      const bool first_check = !initialized;
       factory.reset();
 
       auto status = CreateDXGIFactory1(IID_IDXGIFactory1, (void **) &factory);
       if (FAILED(status)) {
         BOOST_LOG(error) << "Failed to create DXGIFactory1 [0x"sv << util::hex(status).to_string_view() << ']';
         factory.release();
+        return true;
+      }
+
+      initialized = true;
+      if (!first_check && config::video.capture == "wgc") {
+        BOOST_LOG(debug) << "DXGI factory changed during WGC capture; keeping current encoder"sv;
+        return false;
       }
 
       // Always request reenumeration on the first streaming session just to ensure we
