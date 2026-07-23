@@ -1,7 +1,11 @@
 On Windows we use msys2 and ucrt64 to compile.
-You need to prefix commands with `C:\msys64\msys2_shell.cmd -defterm -here -no-start -ucrt64 -c`.
+Use the MSYS2/UCRT64 environment under `E:\Develop\MSYS2\msys64`.
 
-Prefix build directories with `cmake-build-`.
+Preferred command shape:
+
+`E:\Develop\MSYS2\msys64\usr\bin\bash.exe -lc "export PATH=/ucrt64/bin:/usr/bin:$PATH; cd /d/Projects/sunshine && cmake -S . -B build-release-e-msys2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_DOCS=OFF && cmake --build build-release-e-msys2 --config Release -j 12"`
+
+Use `build-release-e-msys2` for the local optimized Release build. Keep docs disabled unless explicitly needed, because this machine does not keep Doxygen/Graphviz in the normal build environment.
 
 The test executable is named `test_sunshine` and will be located inside the `tests` directory within
 the build directory.

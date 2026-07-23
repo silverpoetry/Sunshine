@@ -1,18 +1,27 @@
 $ErrorActionPreference = 'Stop'
 
 $repo = 'D:\Projects\sunshine'
-$buildRoot = Join-Path $repo 'build-release-local'
+$buildRoot = Join-Path $repo 'build-release-e-msys2'
 $portableRoot = 'C:\Users\weich\Desktop\Tools\SystemTool\sunshine-windows-portable\Sunshine'
+$msysZlib = 'E:\Develop\MSYS2\msys64\ucrt64\bin\zlib1.dll'
 $transferFolderName = -join @([char]0x7a7f, [char]0x68ad, [char]0x673a)
 $transferRoot = Join-Path (Join-Path $env:USERPROFILE 'Desktop') $transferFolderName
 $finalPackageRoot = Join-Path $transferRoot 'SunshineUpdate-Current'
 $stagingRoot = Join-Path $env:TEMP 'SunshineUpdate-Current-Staging'
 $packageRoot = Join-Path $stagingRoot 'SunshineUpdate-Current'
+$backupRoot = Join-Path $repo 'local-update-stage\package-backups'
 
 $sourceSunshine = Join-Path $buildRoot 'sunshine.exe'
 $sourceHelper = Join-Path $buildRoot 'tools\sunshine-wgc-helper.exe'
 $sourceWeb = Join-Path $buildRoot 'assets\web'
-$sourceZlib = Join-Path $portableRoot 'zlib1.dll'
+$sourceZlibCandidates = @(
+    $msysZlib,
+    (Join-Path $portableRoot 'zlib1.dll')
+)
+$sourceZlib = $sourceZlibCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (!$sourceZlib) {
+    throw "Required zlib1.dll not found in known locations: $($sourceZlibCandidates -join ', ')"
+}
 
 foreach ($path in @($sourceSunshine, $sourceHelper, $sourceWeb, $sourceZlib)) {
     if (!(Test-Path -LiteralPath $path)) {
@@ -36,10 +45,50 @@ $launchCmd = @'
 @echo off
 setlocal
 cd /d "%~dp0"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-SunshineUpdate.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Bootstrap-SunshineUpdate.ps1"
 pause
 '@
 Set-Content -LiteralPath (Join-Path $packageRoot 'Launch-SunshineUpdate.cmd') -Value $launchCmd -Encoding ASCII
+
+$bootstrapScript = @'
+$ErrorActionPreference = 'Stop'
+
+$sourceRoot = Split-Path -Parent $PSCommandPath
+$runRoot = Join-Path $env:TEMP ('SunshineUpdate-Current-Run-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$safeRoot = Join-Path $runRoot 'SunshineUpdate-Current'
+$bootstrapLog = Join-Path $sourceRoot 'bootstrap.log'
+
+function Write-BootstrapLog {
+    param([string] $Message)
+    $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message
+    Write-Host $line
+    Add-Content -LiteralPath $bootstrapLog -Value $line
+}
+
+Write-BootstrapLog "Copying package to ASCII temp path: $safeRoot"
+New-Item -ItemType Directory -Path $safeRoot -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $sourceRoot '*') -Destination $safeRoot -Recurse -Force
+
+$installScript = Join-Path $safeRoot 'Install-SunshineUpdate.ps1'
+Write-BootstrapLog "Launching elevated installer from temp path"
+$process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ArgumentList @(
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', "`"$installScript`""
+)
+
+Write-BootstrapLog "Elevated installer exit code: $($process.ExitCode)"
+$tempInstallLog = Join-Path $safeRoot 'install.log'
+if (Test-Path -LiteralPath $tempInstallLog) {
+    Copy-Item -LiteralPath $tempInstallLog -Destination (Join-Path $sourceRoot 'install.log') -Force
+    Write-BootstrapLog "Copied install.log back to original package folder"
+}
+
+if ($process.ExitCode -ne 0) {
+    throw "Elevated installer failed with exit code $($process.ExitCode)"
+}
+'@
+Set-Content -LiteralPath (Join-Path $packageRoot 'Bootstrap-SunshineUpdate.ps1') -Value $bootstrapScript -Encoding UTF8
 
 $installScript = @'
 $ErrorActionPreference = 'Stop'
@@ -170,6 +219,8 @@ Usage:
 2. Double-click Launch-SunshineUpdate.cmd.
 3. Approve UAC.
 
+Launch-SunshineUpdate.cmd first copies the package to an ASCII-only temp directory, then runs the elevated installer from there. This avoids Windows command-line/code-page issues when the transfer folder contains Chinese characters.
+
 The installer will:
 - stop SunshineService and remaining sunshine.exe processes
 - back up sunshine.exe, tools\sunshine-wgc-helper.exe, zlib1.dll, and assets\web
@@ -197,6 +248,10 @@ if (Test-Path -LiteralPath $finalPackageRoot) {
 Copy-Item -LiteralPath $packageRoot -Destination $transferRoot -Recurse -Force
 Set-Content -LiteralPath (Join-Path $transferRoot 'shareTXT.txt') -Value $shareText -Encoding UTF8
 
+New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+$backupPackage = Join-Path $backupRoot ('SunshineUpdate-Current-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+Copy-Item -LiteralPath $packageRoot -Destination $backupPackage -Recurse -Force
+
 $files = Get-ChildItem -LiteralPath $finalPackageRoot -Recurse -File
 $totalBytes = ($files | Measure-Object -Property Length -Sum).Sum
 $webFiles = Get-ChildItem -LiteralPath (Join-Path $finalPackageRoot 'assets\web') -Recurse -File
@@ -207,4 +262,5 @@ $webFiles = Get-ChildItem -LiteralPath (Join-Path $finalPackageRoot 'assets\web'
     TotalMB = [math]::Round($totalBytes / 1MB, 2)
     WebFileCount = $webFiles.Count
     HasConfigFiles = [bool](Get-ChildItem -LiteralPath $finalPackageRoot -Recurse -File | Where-Object { $_.Name -match 'sunshine\.conf|sunshine\.log|\\.bak' })
+    BackupRoot = $backupPackage
 }

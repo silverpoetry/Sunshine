@@ -2,5 +2,8 @@
 !/.gitignore
 !/BUILD_AND_UPDATE_NOTES.md
 !/Build-Sunshine-UCRT.ps1
+!/Create-SunshinePortablePackage.ps1
 !/Create-TargetSunshineUpdatePackage.ps1
+!/Install-LocalProgramFilesSunshine.cmd
+!/Install-LocalProgramFilesSunshine.ps1
 !/Update-LocalPortableSunshine.ps1
