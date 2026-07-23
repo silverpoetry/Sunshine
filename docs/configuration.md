@@ -688,6 +688,31 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### native_touchpad_optimization
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            When enabled, Sunshine advertises native touchpad frame support for Xiaomi tablet keyboard touchpads.
+            <br>
+            Disable this to fall back to legacy per-contact touchpad events.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            native_touchpad_optimization = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### native_cursor
 
 <table>

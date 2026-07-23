@@ -296,6 +296,8 @@
     "native_cursor_desc": "When enabled, Sunshine can send cursor shape updates separately to clients that explicitly support this Sunshine extension. Older clients keep receiving the cursor in the video stream.",
     "native_pen_touch": "Native Pen/Touch Support",
     "native_pen_touch_desc": "When enabled, Sunshine will pass through native pen/touch events from Moonlight clients. This can be useful to disable for older applications without native pen/touch support.",
+    "native_touchpad_optimization": "Xiaomi Tablet Touchpad Support",
+    "native_touchpad_optimization_desc": "When enabled, Sunshine will advertise native touchpad frame support for Xiaomi tablet keyboard touchpads. Disable this to fall back to legacy touchpad events.",
     "notify_pre_releases": "PreRelease Notifications",
     "notify_pre_releases_desc": "Whether to be notified of new pre-release versions of Sunshine",
     "nvenc_h264_cavlc": "Prefer CAVLC over CABAC in H.264",

@@ -583,6 +583,7 @@ namespace config {
     true,  // always send scancodes
     true,  // high resolution scrolling
     true,  // native pen/touch support
+    true,  // native touchpad optimization
     true,  // native cursor support
   };
 
@@ -1316,6 +1317,7 @@ namespace config {
 
     bool_f(vars, "high_resolution_scrolling", input.high_resolution_scrolling);
     bool_f(vars, "native_pen_touch", input.native_pen_touch);
+    bool_f(vars, "native_touchpad_optimization", input.native_touchpad_optimization);
     bool_f(vars, "native_cursor", input.native_cursor);
 
     bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);

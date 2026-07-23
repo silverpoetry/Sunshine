@@ -182,6 +182,15 @@ const config = ref(props.config)
               default="true"
     ></Checkbox>
 
+    <!-- Native touchpad optimization -->
+    <Checkbox v-if="config.mouse === 'enabled' && platform === 'windows'"
+              class="mb-3"
+              id="native_touchpad_optimization"
+              locale-prefix="config"
+              v-model="config.native_touchpad_optimization"
+              default="true"
+    ></Checkbox>
+
     <!-- Native cursor support -->
     <Checkbox v-if="config.mouse === 'enabled' && platform === 'windows'"
               class="mb-3"
