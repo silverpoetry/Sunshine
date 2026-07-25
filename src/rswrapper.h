@@ -5,12 +5,8 @@
  */
 #pragma once
 
-// standard includes
-#include <stdint.h>
-
-#define DATA_SHARDS_MAX 255
-
-typedef struct _reed_solomon reed_solomon;
+// lib includes
+#include <rs.h>
 
 typedef reed_solomon *(*reed_solomon_new_t)(int data_shards, int parity_shards);
 typedef void (*reed_solomon_release_t)(reed_solomon *rs);
