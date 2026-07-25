@@ -985,25 +985,35 @@ namespace platf {
    */
   std::unique_ptr<high_precision_timer> create_high_precision_timer();
 
-  /**
-   * @brief Check whether the platform backend supports text clipboard access.
-   * @return `true` if get_clipboard_text() and set_clipboard_text() are available.
-   */
-  bool supports_clipboard_text();
+  struct clipboard_content_t {
+    std::uint8_t mime_type {};
+    std::uint64_t origin_id {};
+    std::uint64_t item_id {};
+    std::vector<std::uint8_t> data;
+  };
 
   /**
-   * @brief Read the current host clipboard as UTF-8 text.
-   * @param content Receives the clipboard contents.
-   * @return `true` when text was read successfully, `false` if unavailable or unsupported.
+   * @brief Return the LI_CLIPBOARD_CAP_* formats supported by the platform.
    */
-  bool get_clipboard_text(std::string &content);
+  std::uint8_t clipboard_capabilities();
 
   /**
-   * @brief Set the host clipboard to UTF-8 text.
-   * @param content Clipboard contents.
-   * @return `true` when the clipboard was written successfully, `false` if unavailable or unsupported.
+   * @brief Return the native clipboard change sequence.
+   *
+   * The value changes whenever the OS clipboard changes, allowing the stream
+   * thread to avoid polling and decoding clipboard contents on a timer.
    */
-  bool set_clipboard_text(const std::string &content);
+  std::uint64_t clipboard_sequence();
+
+  /**
+   * @brief Read the best available clipboard representation allowed by the caller.
+   */
+  bool get_clipboard_content(std::uint8_t allowed_capabilities, clipboard_content_t &content);
+
+  /**
+   * @brief Replace the host clipboard and attach protocol identity metadata.
+   */
+  bool set_clipboard_content(const clipboard_content_t &content);
 
   /**
    * @brief Check is the current process is running with elevated privileges (e.g. system admin/etc.)

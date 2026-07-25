@@ -98,10 +98,12 @@ list(PREPEND PLATFORM_LIBRARIES
         libwinpthread.a
         minhook::minhook
         ntdll
+        ole32
         setupapi
         shlwapi
         synchronization.lib
         userenv
+        windowscodecs
         ws2_32
         wsock32
 )

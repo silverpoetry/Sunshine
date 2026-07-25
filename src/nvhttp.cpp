@@ -6,6 +6,7 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <cctype>
 #include <filesystem>
 #include <format>
 #include <string>
@@ -21,6 +22,7 @@
 
 // local includes
 #include "config.h"
+#include "clipboard_blob_store.h"
 #include "display_device.h"
 #include "file_handler.h"
 #include "globals.h"
@@ -31,6 +33,7 @@
 #include "platform/common.h"
 #include "process.h"
 #include "rtsp.h"
+#include "stream.h"
 #include "system_tray.h"
 #include "utility.h"
 #include "uuid.h"
@@ -1076,6 +1079,172 @@ namespace nvhttp {
 
   bool is_client_enabled(const std::string_view cert_pem);
 
+  namespace {
+    bool parse_decimal_u64(std::string_view value, std::uint64_t &result) {
+      if (value.empty() ||
+          !std::all_of(value.begin(), value.end(), [](unsigned char character) {
+            return std::isdigit(character) != 0;
+          })) {
+        return false;
+      }
+      try {
+        std::size_t consumed = 0;
+        result = std::stoull(std::string(value), &consumed);
+        return consumed == value.size();
+      } catch (...) {
+        return false;
+      }
+    }
+
+    std::string digest_hex(const clipboard_blob_store::digest_t &digest) {
+      static constexpr char hex[] = "0123456789abcdef";
+      std::string output(digest.size() * 2, '\0');
+      for (std::size_t index = 0; index < digest.size(); ++index) {
+        output[index * 2] = hex[digest[index] >> 4];
+        output[index * 2 + 1] = hex[digest[index] & 0x0F];
+      }
+      return output;
+    }
+
+    template <typename Response>
+    void write_clipboard_json(Response response, SimpleWeb::StatusCode status, std::string body) {
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", "application/json");
+      headers.emplace("Cache-Control", "no-store");
+      response->write(status, std::move(body), headers);
+    }
+
+    bool validate_clipboard_origin(const req_https_t &request, std::uint64_t &origin_id) {
+      auto origin = request->header.find("X-Clipboard-Origin");
+      return origin != request->header.end() &&
+             parse_decimal_u64(origin->second, origin_id) &&
+             stream::is_clipboard_origin_active(origin_id);
+    }
+
+    void upload_clipboard_blob(resp_https_t response, req_https_t request) {
+      std::uint64_t origin_id {};
+      if (!validate_clipboard_origin(request, origin_id)) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_forbidden,
+                             R"({"error":"inactive_clipboard_session"})");
+        return;
+      }
+
+      auto length_header = request->header.find("Content-Length");
+      std::uint64_t content_length {};
+      if (length_header == request->header.end() ||
+          !parse_decimal_u64(length_header->second, content_length) ||
+          content_length == 0 ||
+          content_length > clipboard_blob_store::max_blob_bytes) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_payload_too_large,
+                             R"({"error":"bad_content_length"})");
+        return;
+      }
+
+      auto mime_header = request->header.find("X-Clipboard-Mime");
+      if (mime_header == request->header.end() ||
+          (mime_header->second != "text/plain" && mime_header->second != "image/png")) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_bad_request,
+                             R"({"error":"unsupported_mime"})");
+        return;
+      }
+
+      auto idempotency_header = request->header.find("X-Clipboard-Idempotency-Key");
+      if (idempotency_header == request->header.end() ||
+          idempotency_header->second.empty() ||
+          idempotency_header->second.size() > 128 ||
+          !std::all_of(idempotency_header->second.begin(),
+                       idempotency_header->second.end(),
+                       [](unsigned char character) {
+                         return std::isalnum(character) != 0 ||
+                                character == '-' ||
+                                character == '_' ||
+                                character == '.';
+                       })) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_bad_request,
+                             R"({"error":"bad_idempotency_key"})");
+        return;
+      }
+
+      std::vector<std::uint8_t> bytes;
+      bytes.reserve(static_cast<std::size_t>(content_length));
+      std::istreambuf_iterator<char> begin(request->content);
+      std::istreambuf_iterator<char> end;
+      for (auto position = begin; position != end; ++position) {
+        if (bytes.size() == content_length) {
+          write_clipboard_json(response,
+                               SimpleWeb::StatusCode::client_error_payload_too_large,
+                               R"({"error":"content_length_mismatch"})");
+          return;
+        }
+        bytes.push_back(static_cast<std::uint8_t>(*position));
+      }
+      if (bytes.size() != content_length) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_bad_request,
+                             R"({"error":"content_length_mismatch"})");
+        return;
+      }
+
+      auto result = clipboard_blob_store::put(std::move(bytes),
+                                              mime_header->second,
+                                              origin_id,
+                                              idempotency_header->second);
+      if (!result.ok) {
+        const auto status = result.error == "too_large" ?
+                              SimpleWeb::StatusCode::client_error_payload_too_large :
+                              SimpleWeb::StatusCode::client_error_conflict;
+        write_clipboard_json(response,
+                             status,
+                             std::format(R"({{"error":"{}"}})", result.error));
+        return;
+      }
+
+      write_clipboard_json(response,
+                           SimpleWeb::StatusCode::success_ok,
+                           std::format(
+                             R"({{"id":"{}","size":{},"sha256":"{}","expires_in":{}}})",
+                             result.id,
+                             result.size,
+                             digest_hex(result.sha256),
+                             clipboard_blob_store::blob_ttl_seconds));
+    }
+
+    void download_clipboard_blob(resp_https_t response, req_https_t request) {
+      std::uint64_t origin_id {};
+      if (!validate_clipboard_origin(request, origin_id)) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_forbidden,
+                             R"({"error":"inactive_clipboard_session"})");
+        return;
+      }
+      (void) origin_id;
+
+      const std::string id = request->path_match.size() >= 2 ?
+                               request->path_match[1].str() :
+                               std::string {};
+      auto blob = clipboard_blob_store::get(id);
+      if (!blob.found) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_not_found,
+                             R"({"error":"not_found"})");
+        return;
+      }
+
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", blob.mime);
+      headers.emplace("Content-Length", std::to_string(blob.bytes.size()));
+      headers.emplace("X-Clipboard-SHA256", digest_hex(blob.sha256));
+      headers.emplace("X-Content-Type-Options", "nosniff");
+      headers.emplace("Cache-Control", "no-store");
+      std::string body(reinterpret_cast<const char *>(blob.bytes.data()), blob.bytes.size());
+      response->write(SimpleWeb::StatusCode::success_ok, std::move(body), headers);
+    }
+  }  // namespace
+
   void start() {
     platf::set_thread_name("nvhttp");
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
@@ -1186,6 +1355,8 @@ namespace nvhttp {
       resume(host_audio, resp, req);
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
+    https_server.resource["^/api/v2/clipboard/blobs$"]["POST"] = upload_clipboard_blob;
+    https_server.resource["^/api/v2/clipboard/blobs/([0-9a-f\\-]{36})$"]["GET"] = download_clipboard_blob;
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);

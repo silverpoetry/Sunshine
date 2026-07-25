@@ -28,6 +28,7 @@
 #include <WinSock2.h>
 #include <Windows.h>
 #include <WinUser.h>
+#include <wincodec.h>
 #include <wlanapi.h>
 #include <WS2tcpip.h>
 #include <WtsApi32.h>
@@ -1928,49 +1929,486 @@ namespace platf {
     return std::make_unique<win32_high_precision_timer>();
   }
 
-  bool supports_clipboard_text() {
-    return true;
-  }
+  namespace {
+    constexpr std::uint32_t clipboard_identity_magic = 0x32434C4D;  // "MLC2"
+    constexpr std::size_t clipboard_max_host_bytes = 32ULL * 1024ULL * 1024ULL;
+    constexpr std::size_t clipboard_max_bitmap_bytes =
+      sizeof(BITMAPV5HEADER) + 4ULL * LI_CLIPBOARD_MAX_IMAGE_PIXELS;
 
-  bool get_clipboard_text(std::string &content) {
-    content.clear();
+#pragma pack(push, 1)
+    struct clipboard_identity_t {
+      std::uint32_t magic;
+      std::uint8_t mime_type;
+      std::uint8_t reserved[3];
+      std::uint64_t origin_id;
+      std::uint64_t item_id;
+    };
+#pragma pack(pop)
 
-    if (!OpenClipboard(nullptr)) {
-      BOOST_LOG(debug) << "Failed to open clipboard for reading";
+    UINT clipboard_png_format() {
+      static const UINT format = RegisterClipboardFormatW(L"PNG");
+      return format;
+    }
+
+    UINT clipboard_identity_format() {
+      static const UINT format = RegisterClipboardFormatW(L"MoonlightClipboardIdentityV2");
+      return format;
+    }
+
+    bool open_clipboard_with_retry() {
+      for (int attempt = 0; attempt < 5; ++attempt) {
+        if (OpenClipboard(nullptr)) {
+          return true;
+        }
+        Sleep(2);
+      }
       return false;
     }
 
+    class clipboard_wic_context_t {
+    public:
+      clipboard_wic_context_t() {
+        const HRESULT initialize_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (SUCCEEDED(initialize_result)) {
+          uninitialize_ = true;
+        } else if (initialize_result != RPC_E_CHANGED_MODE) {
+          return;
+        }
+
+        CoCreateInstance(CLSID_WICImagingFactory,
+                         nullptr,
+                         CLSCTX_INPROC_SERVER,
+                         IID_IWICImagingFactory,
+                         reinterpret_cast<void **>(&factory_));
+      }
+
+      ~clipboard_wic_context_t() {
+        if (factory_) {
+          factory_->Release();
+        }
+        if (uninitialize_) {
+          CoUninitialize();
+        }
+      }
+
+      explicit operator bool() const {
+        return factory_ != nullptr;
+      }
+
+      IWICImagingFactory *factory() const {
+        return factory_;
+      }
+
+    private:
+      bool uninitialize_ {};
+      IWICImagingFactory *factory_ {};
+    };
+
+    bool png_to_dibv5(const std::vector<std::uint8_t> &png,
+                      std::vector<std::uint8_t> &dib) {
+      if (png.empty() || png.size() > clipboard_max_host_bytes ||
+          !LiIsValidClipboardPngHeader(png.data(), png.size())) {
+        return false;
+      }
+
+      clipboard_wic_context_t wic;
+      if (!wic) {
+        return false;
+      }
+
+      IStream *stream = SHCreateMemStream(png.data(), static_cast<UINT>(png.size()));
+      if (!stream) {
+        return false;
+      }
+      auto release_stream = util::fail_guard([stream]() {
+        stream->Release();
+      });
+
+      IWICBitmapDecoder *decoder = nullptr;
+      if (FAILED(wic.factory()->CreateDecoderFromStream(
+            stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder))) {
+        return false;
+      }
+      auto release_decoder = util::fail_guard([decoder]() {
+        decoder->Release();
+      });
+
+      IWICBitmapFrameDecode *frame = nullptr;
+      if (FAILED(decoder->GetFrame(0, &frame))) {
+        return false;
+      }
+      auto release_frame = util::fail_guard([frame]() {
+        frame->Release();
+      });
+
+      UINT width;
+      UINT height;
+      if (FAILED(frame->GetSize(&width, &height)) ||
+          width == 0 ||
+          height == 0 ||
+          static_cast<std::uint64_t>(width) * height > LI_CLIPBOARD_MAX_IMAGE_PIXELS) {
+        return false;
+      }
+
+      IWICFormatConverter *converter = nullptr;
+      if (FAILED(wic.factory()->CreateFormatConverter(&converter))) {
+        return false;
+      }
+      auto release_converter = util::fail_guard([converter]() {
+        converter->Release();
+      });
+
+      if (FAILED(converter->Initialize(frame,
+                                       GUID_WICPixelFormat32bppBGRA,
+                                       WICBitmapDitherTypeNone,
+                                       nullptr,
+                                       0.0,
+                                       WICBitmapPaletteTypeCustom))) {
+        return false;
+      }
+
+      const std::uint64_t stride = static_cast<std::uint64_t>(width) * 4;
+      const std::uint64_t image_bytes = stride * height;
+      if (image_bytes > clipboard_max_bitmap_bytes - sizeof(BITMAPV5HEADER)) {
+        return false;
+      }
+
+      dib.assign(sizeof(BITMAPV5HEADER) + static_cast<std::size_t>(image_bytes), 0);
+      auto header = reinterpret_cast<BITMAPV5HEADER *>(dib.data());
+      header->bV5Size = sizeof(BITMAPV5HEADER);
+      header->bV5Width = static_cast<LONG>(width);
+      header->bV5Height = -static_cast<LONG>(height);
+      header->bV5Planes = 1;
+      header->bV5BitCount = 32;
+      header->bV5Compression = BI_BITFIELDS;
+      header->bV5SizeImage = static_cast<DWORD>(image_bytes);
+      header->bV5RedMask = 0x00FF0000;
+      header->bV5GreenMask = 0x0000FF00;
+      header->bV5BlueMask = 0x000000FF;
+      header->bV5AlphaMask = 0xFF000000;
+      header->bV5CSType = LCS_sRGB;
+      header->bV5Intent = LCS_GM_IMAGES;
+
+      return SUCCEEDED(converter->CopyPixels(
+        nullptr,
+        static_cast<UINT>(stride),
+        static_cast<UINT>(image_bytes),
+        dib.data() + sizeof(BITMAPV5HEADER)));
+    }
+
+    bool dibv5_to_png(std::vector<std::uint8_t> &png) {
+      HANDLE handle = GetClipboardData(CF_DIBV5);
+      if (!handle) {
+        return false;
+      }
+
+      const SIZE_T dib_size = GlobalSize(handle);
+      if (dib_size < sizeof(BITMAPV5HEADER) || dib_size > clipboard_max_bitmap_bytes) {
+        return false;
+      }
+
+      auto data = static_cast<const std::uint8_t *>(GlobalLock(handle));
+      if (!data) {
+        return false;
+      }
+      auto unlock = util::fail_guard([handle]() {
+        GlobalUnlock(handle);
+      });
+
+      auto header = reinterpret_cast<const BITMAPV5HEADER *>(data);
+      const std::int64_t signed_height = header->bV5Height;
+      const std::uint64_t width = header->bV5Width;
+      const std::uint64_t height = signed_height < 0 ? -signed_height : signed_height;
+      if (header->bV5Size != sizeof(BITMAPV5HEADER) ||
+          header->bV5Width <= 0 ||
+          height == 0 ||
+          header->bV5Planes != 1 ||
+          header->bV5BitCount != 32 ||
+          (header->bV5Compression != BI_RGB &&
+           header->bV5Compression != BI_BITFIELDS) ||
+          (header->bV5Compression == BI_BITFIELDS &&
+           (header->bV5RedMask != 0x00FF0000 ||
+            header->bV5GreenMask != 0x0000FF00 ||
+            header->bV5BlueMask != 0x000000FF ||
+            (header->bV5AlphaMask != 0 && header->bV5AlphaMask != 0xFF000000))) ||
+          width * height > LI_CLIPBOARD_MAX_IMAGE_PIXELS) {
+        return false;
+      }
+
+      const std::uint64_t stride = width * 4;
+      const std::uint64_t image_bytes = stride * height;
+      if (image_bytes > dib_size - sizeof(BITMAPV5HEADER)) {
+        return false;
+      }
+
+      const std::uint8_t *source = data + sizeof(BITMAPV5HEADER);
+      std::vector<std::uint8_t> top_down;
+      if (signed_height > 0) {
+        top_down.resize(static_cast<std::size_t>(image_bytes));
+        for (std::uint64_t row = 0; row < height; ++row) {
+          std::memcpy(top_down.data() + row * stride,
+                      source + (height - row - 1) * stride,
+                      static_cast<std::size_t>(stride));
+        }
+        source = top_down.data();
+      }
+
+      clipboard_wic_context_t wic;
+      if (!wic) {
+        return false;
+      }
+
+      IWICBitmap *bitmap = nullptr;
+      if (FAILED(wic.factory()->CreateBitmapFromMemory(
+            static_cast<UINT>(width),
+            static_cast<UINT>(height),
+            GUID_WICPixelFormat32bppBGRA,
+            static_cast<UINT>(stride),
+            static_cast<UINT>(image_bytes),
+            const_cast<BYTE *>(source),
+            &bitmap))) {
+        return false;
+      }
+      auto release_bitmap = util::fail_guard([bitmap]() {
+        bitmap->Release();
+      });
+
+      IStream *stream = nullptr;
+      if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream))) {
+        return false;
+      }
+      auto release_stream = util::fail_guard([stream]() {
+        stream->Release();
+      });
+
+      IWICBitmapEncoder *encoder = nullptr;
+      if (FAILED(wic.factory()->CreateEncoder(
+            GUID_ContainerFormatPng, nullptr, &encoder))) {
+        return false;
+      }
+      auto release_encoder = util::fail_guard([encoder]() {
+        encoder->Release();
+      });
+      if (FAILED(encoder->Initialize(stream, WICBitmapEncoderNoCache))) {
+        return false;
+      }
+
+      IWICBitmapFrameEncode *frame = nullptr;
+      IPropertyBag2 *properties = nullptr;
+      if (FAILED(encoder->CreateNewFrame(&frame, &properties))) {
+        return false;
+      }
+      auto release_properties = util::fail_guard([properties]() {
+        if (properties) {
+          properties->Release();
+        }
+      });
+      auto release_frame = util::fail_guard([frame]() {
+        frame->Release();
+      });
+
+      WICPixelFormatGUID pixel_format = GUID_WICPixelFormat32bppBGRA;
+      if (FAILED(frame->Initialize(properties)) ||
+          FAILED(frame->SetSize(static_cast<UINT>(width), static_cast<UINT>(height))) ||
+          FAILED(frame->SetPixelFormat(&pixel_format)) ||
+          !IsEqualGUID(pixel_format, GUID_WICPixelFormat32bppBGRA) ||
+          FAILED(frame->WriteSource(bitmap, nullptr)) ||
+          FAILED(frame->Commit()) ||
+          FAILED(encoder->Commit())) {
+        return false;
+      }
+
+      HGLOBAL output_handle = nullptr;
+      if (FAILED(GetHGlobalFromStream(stream, &output_handle)) || !output_handle) {
+        return false;
+      }
+      const SIZE_T output_size = GlobalSize(output_handle);
+      if (output_size == 0 || output_size > clipboard_max_host_bytes) {
+        return false;
+      }
+      auto output = static_cast<const std::uint8_t *>(GlobalLock(output_handle));
+      if (!output) {
+        return false;
+      }
+      auto unlock_output = util::fail_guard([output_handle]() {
+        GlobalUnlock(output_handle);
+      });
+
+      png.assign(output, output + output_size);
+      return LiIsValidClipboardPngHeader(png.data(), png.size());
+    }
+
+    bool copy_global_memory(UINT format, std::vector<std::uint8_t> &data) {
+      HANDLE handle = GetClipboardData(format);
+      if (!handle) {
+        return false;
+      }
+
+      const SIZE_T size = GlobalSize(handle);
+      if (size == 0 || size > clipboard_max_host_bytes) {
+        return false;
+      }
+
+      auto bytes = static_cast<const std::uint8_t *>(GlobalLock(handle));
+      if (!bytes) {
+        return false;
+      }
+      auto unlock = util::fail_guard([handle]() {
+        GlobalUnlock(handle);
+      });
+
+      data.assign(bytes, bytes + size);
+      return true;
+    }
+
+    bool set_global_clipboard_data(UINT format, const void *data, std::size_t size) {
+      HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, size);
+      if (!memory) {
+        return false;
+      }
+
+      void *destination = GlobalLock(memory);
+      if (!destination) {
+        GlobalFree(memory);
+        return false;
+      }
+      std::memcpy(destination, data, size);
+      GlobalUnlock(memory);
+
+      if (!SetClipboardData(format, memory)) {
+        GlobalFree(memory);
+        return false;
+      }
+      return true;
+    }
+
+    void read_clipboard_identity(clipboard_content_t &content) {
+      HANDLE handle = GetClipboardData(clipboard_identity_format());
+      if (!handle || GlobalSize(handle) != sizeof(clipboard_identity_t)) {
+        return;
+      }
+
+      auto identity = static_cast<const clipboard_identity_t *>(GlobalLock(handle));
+      if (!identity) {
+        return;
+      }
+      auto unlock = util::fail_guard([handle]() {
+        GlobalUnlock(handle);
+      });
+
+      if (identity->magic == clipboard_identity_magic &&
+          identity->mime_type == content.mime_type &&
+          identity->origin_id != 0 &&
+          identity->item_id != 0) {
+        content.origin_id = identity->origin_id;
+        content.item_id = identity->item_id;
+      }
+    }
+  }  // namespace
+
+  std::uint8_t clipboard_capabilities() {
+    return LI_CLIPBOARD_CAP_TEXT | LI_CLIPBOARD_CAP_PNG | LI_CLIPBOARD_CAP_BLOB;
+  }
+
+  std::uint64_t clipboard_sequence() {
+    return GetClipboardSequenceNumber();
+  }
+
+  bool get_clipboard_content(std::uint8_t allowed_capabilities, clipboard_content_t &content) {
+    content = {};
+
+    if (!open_clipboard_with_retry()) {
+      BOOST_LOG(debug) << "Failed to open clipboard for reading";
+      return false;
+    }
     auto close_clipboard = util::fail_guard([]() {
       CloseClipboard();
     });
 
-    HANDLE data = GetClipboardData(CF_UNICODETEXT);
-    if (!data) {
+    if ((allowed_capabilities & LI_CLIPBOARD_CAP_PNG) != 0 &&
+        IsClipboardFormatAvailable(clipboard_png_format())) {
+      if (!copy_global_memory(clipboard_png_format(), content.data) ||
+          !LiIsValidClipboardPngHeader(content.data.data(), content.data.size())) {
+        content.data.clear();
+      } else {
+        content.mime_type = LI_CLIPBOARD_MIME_PNG;
+        read_clipboard_identity(content);
+        return true;
+      }
+    }
+
+    if ((allowed_capabilities & LI_CLIPBOARD_CAP_PNG) != 0 &&
+        IsClipboardFormatAvailable(CF_DIBV5) &&
+        dibv5_to_png(content.data)) {
+      content.mime_type = LI_CLIPBOARD_MIME_PNG;
+      read_clipboard_identity(content);
+      return true;
+    }
+
+    if ((allowed_capabilities & LI_CLIPBOARD_CAP_TEXT) == 0 ||
+        !IsClipboardFormatAvailable(CF_UNICODETEXT)) {
       return false;
     }
 
-    auto text = static_cast<const wchar_t *>(GlobalLock(data));
+    HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+    if (!handle) {
+      return false;
+    }
+
+    const SIZE_T byte_size = GlobalSize(handle);
+    if (byte_size < sizeof(wchar_t) ||
+        byte_size > (LI_CLIPBOARD_MAX_TEXT_BYTES + 1ULL) * sizeof(wchar_t) ||
+        byte_size % sizeof(wchar_t) != 0) {
+      return false;
+    }
+
+    auto text = static_cast<const wchar_t *>(GlobalLock(handle));
     if (!text) {
-      BOOST_LOG(debug) << "Failed to lock clipboard data";
+      BOOST_LOG(debug) << "Failed to lock clipboard text";
       return false;
     }
-
-    auto unlock_data = util::fail_guard([data]() {
-      GlobalUnlock(data);
+    auto unlock = util::fail_guard([handle]() {
+      GlobalUnlock(handle);
     });
 
-    content = utf_utils::to_utf8(text);
-    return true;
+    const std::size_t max_characters = byte_size / sizeof(wchar_t);
+    const wchar_t *terminator = std::find(text, text + max_characters, L'\0');
+    if (terminator == text + max_characters) {
+      return false;
+    }
+
+    try {
+      auto utf8 = utf_utils::to_utf8(std::wstring(text, terminator));
+      if (utf8.size() > LI_CLIPBOARD_MAX_TEXT_BYTES ||
+          !LiIsValidUtf8ClipboardText(reinterpret_cast<const std::uint8_t *>(utf8.data()), utf8.size())) {
+        return false;
+      }
+      content.mime_type = LI_CLIPBOARD_MIME_TEXT_UTF8;
+      content.data.assign(utf8.begin(), utf8.end());
+      read_clipboard_identity(content);
+      return true;
+    } catch (const std::exception &error) {
+      BOOST_LOG(debug) << "Failed to convert clipboard text: " << error.what();
+      return false;
+    }
   }
 
-  bool set_clipboard_text(const std::string &content) {
-    auto wide = utf_utils::from_utf8(content);
+  bool set_clipboard_content(const clipboard_content_t &content) {
+    if (content.origin_id == 0 || content.item_id == 0) {
+      return false;
+    }
 
-    if (!OpenClipboard(nullptr)) {
+    std::vector<std::uint8_t> dibv5;
+    if (content.mime_type == LI_CLIPBOARD_MIME_PNG &&
+        content.data.size() <= clipboard_max_host_bytes &&
+        LiIsValidClipboardPngHeader(content.data.data(), content.data.size())) {
+      png_to_dibv5(content.data, dibv5);
+    }
+
+    if (!open_clipboard_with_retry()) {
       BOOST_LOG(debug) << "Failed to open clipboard for writing";
       return false;
     }
-
     auto close_clipboard = util::fail_guard([]() {
       CloseClipboard();
     });
@@ -1980,29 +2418,46 @@ namespace platf {
       return false;
     }
 
-    const auto bytes = (wide.size() + 1) * sizeof(wchar_t);
-    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
-    if (!memory) {
-      BOOST_LOG(warning) << "Failed to allocate clipboard memory";
+    bool content_written = false;
+    if (content.mime_type == LI_CLIPBOARD_MIME_TEXT_UTF8 &&
+        content.data.size() <= LI_CLIPBOARD_MAX_TEXT_BYTES &&
+        LiIsValidUtf8ClipboardText(content.data.data(), content.data.size())) {
+      try {
+        std::string utf8(content.data.begin(), content.data.end());
+        auto wide = utf_utils::from_utf8(utf8);
+        const auto bytes = (wide.size() + 1) * sizeof(wchar_t);
+        content_written = set_global_clipboard_data(CF_UNICODETEXT, wide.c_str(), bytes);
+      } catch (const std::exception &error) {
+        BOOST_LOG(debug) << "Failed to convert remote clipboard text: " << error.what();
+      }
+    } else if (content.mime_type == LI_CLIPBOARD_MIME_PNG &&
+               content.data.size() <= clipboard_max_host_bytes &&
+               LiIsValidClipboardPngHeader(content.data.data(), content.data.size())) {
+      content_written = set_global_clipboard_data(clipboard_png_format(),
+                                                  content.data.data(),
+                                                  content.data.size());
+      if (!dibv5.empty()) {
+        content_written =
+          set_global_clipboard_data(CF_DIBV5, dibv5.data(), dibv5.size()) ||
+          content_written;
+      }
+    }
+
+    if (!content_written) {
+      BOOST_LOG(warning) << "Failed to set clipboard content";
       return false;
     }
 
-    auto text = static_cast<wchar_t *>(GlobalLock(memory));
-    if (!text) {
-      BOOST_LOG(warning) << "Failed to lock clipboard memory";
-      GlobalFree(memory);
-      return false;
+    clipboard_identity_t identity {
+      clipboard_identity_magic,
+      content.mime_type,
+      {},
+      content.origin_id,
+      content.item_id,
+    };
+    if (!set_global_clipboard_data(clipboard_identity_format(), &identity, sizeof(identity))) {
+      BOOST_LOG(debug) << "Failed to attach clipboard identity metadata";
     }
-
-    memcpy(text, wide.c_str(), bytes);
-    GlobalUnlock(memory);
-
-    if (!SetClipboardData(CF_UNICODETEXT, memory)) {
-      BOOST_LOG(warning) << "Failed to set clipboard data";
-      GlobalFree(memory);
-      return false;
-    }
-
     return true;
   }
 

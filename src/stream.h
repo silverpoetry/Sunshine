@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <cstdint>
 #include <utility>
 
 // lib includes
@@ -21,6 +22,10 @@ namespace stream {
   constexpr auto AUDIO_STREAM_PORT = 11;
 
   struct session_t;
+
+  // Used by the certificate-authenticated clipboard blob endpoint to ensure
+  // requests are tied to a live Clipboard v2 negotiation that included BLOB.
+  bool is_clipboard_origin_active(std::uint64_t origin_id);
 
   struct config_t {
     audio::config_t audio;

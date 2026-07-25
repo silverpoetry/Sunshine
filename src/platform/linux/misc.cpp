@@ -1239,16 +1239,21 @@ namespace platf {
     return std::make_unique<linux_high_precision_timer>();
   }
 
-  bool supports_clipboard_text() {
+  std::uint8_t clipboard_capabilities() {
+    return 0;
+  }
+
+  std::uint64_t clipboard_sequence() {
+    return 0;
+  }
+
+  bool get_clipboard_content(std::uint8_t allowed_capabilities, clipboard_content_t &content) {
+    (void) allowed_capabilities;
+    content = {};
     return false;
   }
 
-  bool get_clipboard_text(std::string &content) {
-    content.clear();
-    return false;
-  }
-
-  bool set_clipboard_text(const std::string &content) {
+  bool set_clipboard_content(const clipboard_content_t &content) {
     (void) content;
     return false;
   }

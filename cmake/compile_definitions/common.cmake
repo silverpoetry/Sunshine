@@ -59,6 +59,8 @@ list(APPEND PLATFORM_TARGET_FILES ${NVENC_SOURCES})
 
 set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Clipboard.c"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Clipboard.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/PlatformCrypto.c"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/PlatformCrypto.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Rtsp.h"
@@ -87,6 +89,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/main.h"
         "${CMAKE_SOURCE_DIR}/src/crypto.cpp"
         "${CMAKE_SOURCE_DIR}/src/crypto.h"
+        "${CMAKE_SOURCE_DIR}/src/clipboard_blob_store.cpp"
+        "${CMAKE_SOURCE_DIR}/src/clipboard_blob_store.h"
         "${CMAKE_SOURCE_DIR}/src/nvhttp.cpp"
         "${CMAKE_SOURCE_DIR}/src/nvhttp.h"
         "${CMAKE_SOURCE_DIR}/src/httpcommon.cpp"
