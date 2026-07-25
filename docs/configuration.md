@@ -925,6 +925,56 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### microphone_uplink
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Accept encrypted 48 kHz mono microphone audio from supported Moonlight clients over the existing audio UDP
+            connection. Sunshine only advertises this capability when a compatible virtual microphone render endpoint
+            is available.
+            @note{This option is currently supported on Windows.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            microphone_uplink = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### microphone_sink
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The playback/render endpoint paired with a preinstalled virtual microphone. Leave this unset to
+            automatically select Steam Streaming Microphone or VB-CABLE. Sunshine does not install a driver, change
+            the system default input device, or write microphone audio to a physical speaker.
+            @note{This option is currently supported on Windows.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Automatic compatible-device selection.</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            microphone_sink = Steam Streaming Microphone
+            @endcode</td>
+    </tr>
+</table>
+
 ### adapter_name
 
 <table>

@@ -21,6 +21,10 @@
 #include "src/platform/common.h"
 #include "utf_utils.h"
 
+extern "C" {
+#include <moonlight-common-c/src/Srtp.h>
+}
+
 // Must be the last included file
 // clang-format off
 #include "PolicyConfig.h"
@@ -218,6 +222,7 @@ namespace platf::audio {
   using collection_t = util::safe_ptr<IMMDeviceCollection, Release<IMMDeviceCollection>>;
   using audio_client_t = util::safe_ptr<IAudioClient, Release<IAudioClient>>;
   using audio_capture_t = util::safe_ptr<IAudioCaptureClient, Release<IAudioCaptureClient>>;
+  using audio_render_t = util::safe_ptr<IAudioRenderClient, Release<IAudioRenderClient>>;
   using wave_format_t = util::safe_ptr<WAVEFORMATEX, co_task_free<WAVEFORMATEX>>;
   using wstring_t = util::safe_ptr<WCHAR, co_task_free<WCHAR>>;
   using handle_t = util::safe_ptr_v2<void, BOOL, CloseHandle>;
@@ -1154,6 +1159,217 @@ namespace platf::audio {
     audio::device_enum_t device_enum;
     std::string assigned_sink;
   };
+
+  namespace {
+    class thread_com_t {
+    public:
+      thread_com_t():
+          status {CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_SPEED_OVER_MEMORY)} {
+      }
+
+      ~thread_com_t() {
+        if (SUCCEEDED(status)) {
+          CoUninitialize();
+        }
+      }
+
+      explicit operator bool() const {
+        return SUCCEEDED(status) || status == RPC_E_CHANGED_MODE;
+      }
+
+    private:
+      HRESULT status;
+    };
+
+    bool equal_insensitive(std::wstring_view left, std::wstring_view right) {
+      return left.size() == right.size() &&
+             CompareStringOrdinal(left.data(), static_cast<int>(left.size()),
+                                  right.data(), static_cast<int>(right.size()),
+                                  TRUE) == CSTR_EQUAL;
+    }
+
+    bool matches_microphone_endpoint(const std::wstring &configured,
+                                     const wchar_t *device_id,
+                                     const wchar_t *friendly_name,
+                                     const wchar_t *adapter_name,
+                                     const wchar_t *description) {
+      if (!configured.empty()) {
+        return (device_id && equal_insensitive(configured, device_id)) ||
+               (friendly_name && equal_insensitive(configured, friendly_name)) ||
+               (adapter_name && equal_insensitive(configured, adapter_name)) ||
+               (description && equal_insensitive(configured, description));
+      }
+
+      constexpr std::array known_names {
+        L"Steam Streaming Microphone"sv,
+        L"CABLE Input (VB-Audio Virtual Cable)"sv,
+        L"CABLE Input"sv,
+        L"VB-Audio Virtual Cable"sv,
+      };
+      for (const auto name : known_names) {
+        if ((friendly_name && equal_insensitive(name, friendly_name)) ||
+            (adapter_name && equal_insensitive(name, adapter_name)) ||
+            (description && equal_insensitive(name, description))) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    device_t find_microphone_endpoint(device_enum_t &enumerator,
+                                      const std::string &configured_name) {
+      collection_t collection;
+      if (FAILED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection))) {
+        return nullptr;
+      }
+
+      const auto configured = utf_utils::from_utf8(configured_name);
+      UINT count = 0;
+      collection->GetCount(&count);
+      for (UINT index = 0; index < count; ++index) {
+        device_t device;
+        if (FAILED(collection->Item(index, &device))) {
+          continue;
+        }
+
+        wstring_t id;
+        prop_t properties;
+        prop_var_t friendly_name;
+        prop_var_t adapter_name;
+        prop_var_t description;
+        if (FAILED(device->GetId(&id)) ||
+            FAILED(device->OpenPropertyStore(STGM_READ, &properties))) {
+          continue;
+        }
+
+        properties->GetValue(PKEY_Device_FriendlyName, &friendly_name.prop);
+        properties->GetValue(PKEY_DeviceInterface_FriendlyName, &adapter_name.prop);
+        properties->GetValue(PKEY_Device_DeviceDesc, &description.prop);
+        if (matches_microphone_endpoint(
+              configured, id.get(),
+              friendly_name.prop.vt == VT_LPWSTR ? friendly_name.prop.pwszVal : nullptr,
+              adapter_name.prop.vt == VT_LPWSTR ? adapter_name.prop.pwszVal : nullptr,
+              description.prop.vt == VT_LPWSTR ? description.prop.pwszVal : nullptr)) {
+          return device;
+        }
+      }
+      return nullptr;
+    }
+
+    class microphone_sink_wasapi_t final: public ::platf::audio_input_sink_t {
+    public:
+      bool init(const std::string &configured_name) {
+        if (!com) {
+          BOOST_LOG(error) << "Unable to initialize COM for virtual microphone output"sv;
+          return false;
+        }
+
+        if (FAILED(CoCreateInstance(
+              CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+              IID_IMMDeviceEnumerator, reinterpret_cast<void **>(&enumerator)))) {
+          return false;
+        }
+
+        auto device = find_microphone_endpoint(enumerator, configured_name);
+        if (!device ||
+            FAILED(device->Activate(
+              IID_IAudioClient, CLSCTX_ALL, nullptr,
+              reinterpret_cast<void **>(&client)))) {
+          return false;
+        }
+
+        WAVEFORMATEX format {};
+        format.wFormatTag = WAVE_FORMAT_PCM;
+        format.nChannels = 1;
+        format.nSamplesPerSec = ML_MICROPHONE_SAMPLE_RATE;
+        format.wBitsPerSample = 16;
+        format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
+        format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+
+        event.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+        if (!event ||
+            FAILED(client->Initialize(
+              AUDCLNT_SHAREMODE_SHARED,
+              AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+              0, 0, &format, nullptr)) ||
+            FAILED(client->SetEventHandle(event.get())) ||
+            FAILED(client->GetBufferSize(&buffer_frames)) ||
+            FAILED(client->GetService(
+              IID_IAudioRenderClient, reinterpret_cast<void **>(&render))) ||
+            FAILED(client->Start())) {
+          return false;
+        }
+
+        started = true;
+        BOOST_LOG(info) << "Virtual microphone sink opened at 48 kHz mono PCM"sv;
+        return true;
+      }
+
+      bool write(const std::int16_t *samples, std::size_t frame_count) override {
+        while (frame_count != 0) {
+          UINT32 padding = 0;
+          if (FAILED(client->GetCurrentPadding(&padding)) || padding > buffer_frames) {
+            return false;
+          }
+
+          const auto available = buffer_frames - padding;
+          if (available == 0) {
+            if (WaitForSingleObject(event.get(), 1000) != WAIT_OBJECT_0) {
+              return false;
+            }
+            continue;
+          }
+
+          const auto chunk = static_cast<UINT32>(
+            std::min<std::size_t>(available, frame_count));
+          BYTE *output = nullptr;
+          if (FAILED(render->GetBuffer(chunk, &output))) {
+            return false;
+          }
+          std::memcpy(output, samples, chunk * sizeof(*samples));
+          if (FAILED(render->ReleaseBuffer(chunk, 0))) {
+            return false;
+          }
+          samples += chunk;
+          frame_count -= chunk;
+        }
+        return true;
+      }
+
+      void flush() override {
+        if (!started) {
+          return;
+        }
+
+        // Give the shared-mode engine a bounded opportunity to consume queued
+        // samples. Reset() would discard the microphone tail.
+        for (int attempt = 0; attempt < 20; ++attempt) {
+          UINT32 padding = 0;
+          if (FAILED(client->GetCurrentPadding(&padding)) || padding == 0) {
+            break;
+          }
+          WaitForSingleObject(event.get(), 20);
+        }
+      }
+
+      ~microphone_sink_wasapi_t() override {
+        if (started) {
+          client->Stop();
+        }
+      }
+
+    private:
+      thread_com_t com;
+      device_enum_t enumerator;
+      audio_client_t client;
+      audio_render_t render;
+      handle_t event;
+      UINT32 buffer_frames {};
+      bool started {};
+    };
+  }  // namespace
 }  // namespace platf::audio
 
 namespace platf {
@@ -1178,6 +1394,29 @@ namespace platf {
     }
 
     return control;
+  }
+
+  std::unique_ptr<audio_input_sink_t> microphone_sink(const std::string &device_name) {
+    auto sink = std::make_unique<audio::microphone_sink_wasapi_t>();
+    if (!sink->init(device_name)) {
+      return nullptr;
+    }
+    return sink;
+  }
+
+  bool microphone_sink_supported(const std::string &device_name) {
+    audio::thread_com_t com;
+    if (!com) {
+      return false;
+    }
+
+    audio::device_enum_t enumerator;
+    if (FAILED(CoCreateInstance(
+          CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+          IID_IMMDeviceEnumerator, reinterpret_cast<void **>(&enumerator)))) {
+      return false;
+    }
+    return static_cast<bool>(audio::find_microphone_endpoint(enumerator, device_name));
   }
 
   std::unique_ptr<deinit_t> init() {

@@ -59,8 +59,12 @@ list(APPEND PLATFORM_TARGET_FILES ${NVENC_SOURCES})
 
 set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/PlatformCrypto.c"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/PlatformCrypto.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Rtsp.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/RtspParser.c"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Srtp.c"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Srtp.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Video.h"
         "${CMAKE_SOURCE_DIR}/src/upnp.cpp"
         "${CMAKE_SOURCE_DIR}/src/upnp.h"
@@ -101,6 +105,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/input.h"
         "${CMAKE_SOURCE_DIR}/src/audio.cpp"
         "${CMAKE_SOURCE_DIR}/src/audio.h"
+        "${CMAKE_SOURCE_DIR}/src/microphone.cpp"
+        "${CMAKE_SOURCE_DIR}/src/microphone.h"
         "${CMAKE_SOURCE_DIR}/src/platform/common.h"
         "${CMAKE_SOURCE_DIR}/src/process.cpp"
         "${CMAKE_SOURCE_DIR}/src/process.h"

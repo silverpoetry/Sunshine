@@ -120,4 +120,12 @@ namespace platf {
   std::unique_ptr<audio_control_t> audio_control() {
     return std::make_unique<macos_audio_control_t>();
   }
+
+  std::unique_ptr<audio_input_sink_t> microphone_sink(const std::string &) {
+    return nullptr;
+  }
+
+  bool microphone_sink_supported(const std::string &) {
+    return false;
+  }
 }  // namespace platf

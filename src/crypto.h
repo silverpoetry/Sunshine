@@ -120,7 +120,8 @@ namespace crypto {
        * @param iv The initialization vector to be used for the encryption.
        * @return The total length of the ciphertext and GCM tag. Returns -1 in case of an error.
        */
-      int encrypt(const std::string_view &plaintext, std::uint8_t *tag, std::uint8_t *ciphertext, aes_t *iv);
+      int encrypt(const std::string_view &plaintext, std::uint8_t *tag, std::uint8_t *ciphertext, aes_t *iv,
+                  std::string_view aad = {});
 
       /**
        * @brief Encrypts the plaintext using AES GCM mode.
@@ -132,7 +133,12 @@ namespace crypto {
        */
       int encrypt(const std::string_view &plaintext, std::uint8_t *tagged_cipher, aes_t *iv);
 
-      int decrypt(const std::string_view &cipher, std::vector<std::uint8_t> &plaintext, aes_t *iv);
+      int decrypt(const std::string_view &cipher, std::vector<std::uint8_t> &plaintext, aes_t *iv,
+                  std::string_view aad = {});
+
+      int decrypt(const std::string_view &tag, const std::string_view &cipher,
+                  std::vector<std::uint8_t> &plaintext, aes_t *iv,
+                  std::string_view aad = {});
     };
 
     class cbc_t: public cipher_t {

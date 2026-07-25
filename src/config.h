@@ -167,6 +167,8 @@ namespace config {
     std::string virtual_sink;  ///< Virtual audio sink for audio routing
     bool stream;  ///< Enable audio streaming to clients
     bool install_steam_drivers;  ///< Install Steam audio drivers for enhanced compatibility
+    bool microphone_uplink;  ///< Accept secure microphone audio from supported clients
+    std::string microphone_sink;  ///< Virtual microphone render endpoint name or ID
   };
 
   constexpr int ENCRYPTION_MODE_NEVER = 0;  // Never use video encryption, even if the client supports it

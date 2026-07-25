@@ -26,6 +26,7 @@ extern "C" {
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
+#include "microphone.h"
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
@@ -422,6 +423,11 @@ namespace stream {
     udp::socket audio_sock {io_context};
 
     control_server_t control_server;
+
+    // Held for receive() so session teardown cannot destroy a microphone
+    // receiver while the UDP thread is authenticating one of its packets.
+    std::mutex microphone_sessions_mutex;
+    std::map<std::string, session_t *> microphone_sessions;
   };
 
   struct session_t {
@@ -464,6 +470,8 @@ namespace stream {
       std::uint32_t avRiKeyId;
       std::uint32_t timestamp;
       udp::endpoint peer;
+      std::mutex peer_mutex;
+      std::unique_ptr<microphone::receiver_t> microphone;
 
       util::buffer_t<char> shards;
       util::buffer_t<uint8_t *> shards_p;
@@ -1679,7 +1687,7 @@ namespace stream {
 
     auto &io = ctx.io_context;
 
-    udp::endpoint peer;
+    udp::endpoint peer[2];
 
     std::array<char, 2048> buf[2];
     std::function<void(const boost::system::error_code, size_t)> recv_func[2];
@@ -1713,11 +1721,12 @@ namespace stream {
     auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session) {
       recv_func[buf_elem] = [&, buf_elem](const boost::system::error_code &ec, size_t bytes) {
         auto fg = util::fail_guard([&]() {
-          sock.async_receive_from(asio::buffer(buf[buf_elem]), peer, 0, recv_func[buf_elem]);
+          sock.async_receive_from(asio::buffer(buf[buf_elem]), peer[buf_elem], 0, recv_func[buf_elem]);
         });
 
+        auto &recv_peer = peer[buf_elem];
         auto type_str = buf_elem ? "AUDIO"sv : "VIDEO"sv;
-        BOOST_LOG(verbose) << "Recv: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
+        BOOST_LOG(verbose) << "Recv: "sv << recv_peer.address().to_string() << ':' << recv_peer.port() << " :: " << type_str;
 
         populate_peer_to_session();
 
@@ -1731,21 +1740,88 @@ namespace stream {
           return;
         }
 
-        if (bytes == 4) {
+        if (bytes == 4 && std::string_view {buf[buf_elem].data(), bytes} == "PING"sv) {
           // For legacy PING packets, find the matching session by address.
-          auto it = peer_to_session.find(peer.address());
+          auto it = peer_to_session.find(recv_peer.address());
           if (it != std::end(peer_to_session)) {
-            BOOST_LOG(debug) << "RAISE: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
-            it->second->raise(peer, std::string {buf[buf_elem].data(), bytes});
+            BOOST_LOG(debug) << "RAISE: "sv << recv_peer.address().to_string() << ':' << recv_peer.port() << " :: " << type_str;
+            it->second->raise(recv_peer, std::string {buf[buf_elem].data(), bytes});
           }
-        } else if (bytes >= sizeof(SS_PING)) {
+        } else if (bytes == sizeof(SS_PING)) {
           auto ping = (PSS_PING) buf[buf_elem].data();
 
           // For new PING packets that include a client identifier, search by payload.
           auto it = peer_to_session.find(std::string {ping->payload, sizeof(ping->payload)});
           if (it != std::end(peer_to_session)) {
-            BOOST_LOG(debug) << "RAISE: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
-            it->second->raise(peer, std::string {buf[buf_elem].data(), bytes});
+            BOOST_LOG(debug) << "RAISE: "sv << recv_peer.address().to_string() << ':' << recv_peer.port() << " :: " << type_str;
+            it->second->raise(recv_peer, std::string {buf[buf_elem].data(), bytes});
+          }
+        } else if (buf_elem == 1) {
+          microphone::receive_result_t result;
+          session_t *matched_session = nullptr;
+          udp::endpoint previous_peer;
+
+          {
+            std::lock_guard lock {ctx.microphone_sessions_mutex};
+
+            // Try the bound endpoint first. A same-address endpoint is only a
+            // candidate until its SRTP packet authenticates successfully.
+            for (const auto &[_, session] : ctx.microphone_sessions) {
+              udp::endpoint session_peer;
+              {
+                std::lock_guard peer_lock {session->audio.peer_mutex};
+                session_peer = session->audio.peer;
+              }
+              if (session_peer == recv_peer) {
+                result = session->audio.microphone->receive(
+                  {buf[buf_elem].data(), bytes});
+                if (result.authenticated) {
+                  matched_session = session;
+                  previous_peer = session_peer;
+                }
+                break;
+              }
+            }
+
+            if (!matched_session) {
+              for (const auto &[_, session] : ctx.microphone_sessions) {
+                udp::endpoint session_peer;
+                {
+                  std::lock_guard peer_lock {session->audio.peer_mutex};
+                  session_peer = session->audio.peer;
+                }
+                if (session_peer.address() != recv_peer.address()) {
+                  continue;
+                }
+
+                result = session->audio.microphone->receive(
+                  {buf[buf_elem].data(), bytes});
+                if (result.authenticated) {
+                  matched_session = session;
+                  previous_peer = session_peer;
+                  break;
+                }
+              }
+            }
+
+            if (matched_session && previous_peer != recv_peer) {
+              std::lock_guard peer_lock {matched_session->audio.peer_mutex};
+              matched_session->audio.peer = recv_peer;
+              BOOST_LOG(info) << "Promoted authenticated microphone endpoint from "sv
+                              << previous_peer << " to "sv << recv_peer;
+            }
+          }
+
+          if (matched_session && !result.reply.empty()) {
+            auto reply = std::make_shared<std::vector<std::uint8_t>>(std::move(result.reply));
+            audio_sock.async_send_to(
+              asio::buffer(*reply), recv_peer,
+              [reply](const boost::system::error_code &send_ec, std::size_t) {
+                if (send_ec) {
+                  BOOST_LOG(warning) << "Unable to send microphone receiver report: "sv
+                                     << send_ec.message();
+                }
+              });
           }
         }
       };
@@ -1754,8 +1830,8 @@ namespace stream {
     recv_func_init(video_sock, 0, peer_to_video_session);
     recv_func_init(audio_sock, 1, peer_to_audio_session);
 
-    video_sock.async_receive_from(asio::buffer(buf[0]), peer, 0, recv_func[0]);
-    audio_sock.async_receive_from(asio::buffer(buf[1]), peer, 0, recv_func[1]);
+    video_sock.async_receive_from(asio::buffer(buf[0]), peer[0], 0, recv_func[0]);
+    audio_sock.async_receive_from(asio::buffer(buf[1]), peer[1], 0, recv_func[1]);
 
     while (!broadcast_shutdown_event->peek()) {
       io.run();
@@ -2139,7 +2215,12 @@ namespace stream {
       session->audio.sequenceNumber++;
       session->audio.timestamp += session->config.audio.packetDuration;
 
-      auto peer_address = session->audio.peer.address();
+      udp::endpoint audio_peer;
+      {
+        std::lock_guard lock {session->audio.peer_mutex};
+        audio_peer = session->audio.peer;
+      }
+      auto peer_address = audio_peer.address();
       try {
         auto send_info = platf::send_info_t {
           (const char *) &audio_packet,
@@ -2148,7 +2229,7 @@ namespace stream {
           (size_t) bytes,
           (uintptr_t) sock.native_handle(),
           peer_address,
-          session->audio.peer.port(),
+          audio_peer.port(),
           session->localAddress,
         };
         platf::send(send_info);
@@ -2175,7 +2256,7 @@ namespace stream {
               (size_t) bytes,
               (uintptr_t) sock.native_handle(),
               peer_address,
-              session->audio.peer.port(),
+              audio_peer.port(),
               session->localAddress,
             };
             platf::send(send_info);
@@ -2385,6 +2466,26 @@ namespace stream {
     auto address = session->audio.peer.address();
     session->audio.qos = platf::enable_socket_qos(ref->audio_sock.native_handle(), address, session->audio.peer.port(), platf::qos_data_type_e::audio, session->config.audioQosType != 0);
 
+    if (session->audio.microphone) {
+      if (!session->audio.microphone->start()) {
+        session->audio.microphone.reset();
+      } else {
+        std::lock_guard lock {ref->microphone_sessions_mutex};
+        ref->microphone_sessions.emplace(session->audio.ping_payload, session);
+      }
+    }
+
+    auto microphone_guard = util::fail_guard([&]() {
+      if (!session->audio.microphone) {
+        return;
+      }
+      {
+        std::lock_guard lock {ref->microphone_sessions_mutex};
+        ref->microphone_sessions.erase(session->audio.ping_payload);
+      }
+      session->audio.microphone->stop();
+    });
+
     BOOST_LOG(debug) << "Start capturing Audio"sv;
     audio::capture(session->mail, session->config.audio, session);
   }
@@ -2564,6 +2665,16 @@ namespace stream {
       session->audio.avRiKeyId = util::endian::big(*(std::uint32_t *) launch_session.iv.data());
       session->audio.sequenceNumber = 0;
       session->audio.timestamp = 0;
+
+      if ((config.mlFeatureFlags & ML_FF_MICROPHONE_UPLINK) != 0 &&
+          config::audio.microphone_uplink &&
+          platf::microphone_sink_supported(config::audio.microphone_sink)) {
+        session->audio.microphone = std::make_unique<microphone::receiver_t>(
+          launch_session.gcm_key, launch_session.iv, launch_session.av_ping_payload);
+        if (!session->audio.microphone->valid()) {
+          session->audio.microphone.reset();
+        }
+      }
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);

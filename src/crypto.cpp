@@ -144,7 +144,19 @@ namespace crypto {
       return 0;
     }
 
-    int gcm_t::decrypt(const std::string_view &tagged_cipher, std::vector<std::uint8_t> &plaintext, aes_t *iv) {
+    int gcm_t::decrypt(const std::string_view &tagged_cipher, std::vector<std::uint8_t> &plaintext,
+                       aes_t *iv, std::string_view aad) {
+      if (tagged_cipher.size() < tag_size) {
+        return -1;
+      }
+
+      return decrypt(tagged_cipher.substr(0, tag_size),
+                     tagged_cipher.substr(tag_size), plaintext, iv, aad);
+    }
+
+    int gcm_t::decrypt(const std::string_view &tag, const std::string_view &cipher,
+                       std::vector<std::uint8_t> &plaintext, aes_t *iv,
+                       std::string_view aad) {
       if (!decrypt_ctx && init_decrypt_gcm(decrypt_ctx, &key, iv, padding)) {
         return -1;
       }
@@ -152,16 +164,22 @@ namespace crypto {
       // Calling with cipher == nullptr results in a parameter change
       // without requiring a reallocation of the internal cipher ctx.
       if (EVP_DecryptInit_ex(decrypt_ctx.get(), nullptr, nullptr, nullptr, iv->data()) != 1) {
-        return false;
+        return -1;
       }
-
-      auto cipher = tagged_cipher.substr(tag_size);
-      auto tag = tagged_cipher.substr(0, tag_size);
 
       plaintext.resize(round_to_pkcs7_padded(cipher.size()));
 
       int final_outlen;
       int update_outlen;
+
+      if (!aad.empty()) {
+        int aad_outlen;
+        if (EVP_DecryptUpdate(decrypt_ctx.get(), nullptr, &aad_outlen,
+                              reinterpret_cast<const std::uint8_t *>(aad.data()),
+                              static_cast<int>(aad.size())) != 1) {
+          return -1;
+        }
+      }
 
       if (EVP_DecryptUpdate(decrypt_ctx.get(), plaintext.data(), &update_outlen, (const std::uint8_t *) cipher.data(), (int) cipher.size()) != 1) {
         return -1;
@@ -184,7 +202,8 @@ namespace crypto {
      * The function handles the creation and initialization of the encryption context, and manages the encryption process.
      * The resulting ciphertext and the GCM tag are written into the tagged_cipher buffer.
      */
-    int gcm_t::encrypt(const std::string_view &plaintext, std::uint8_t *tag, std::uint8_t *ciphertext, aes_t *iv) {
+    int gcm_t::encrypt(const std::string_view &plaintext, std::uint8_t *tag,
+                       std::uint8_t *ciphertext, aes_t *iv, std::string_view aad) {
       if (!encrypt_ctx && init_encrypt_gcm(encrypt_ctx, &key, iv, padding)) {
         return -1;
       }
@@ -197,6 +216,15 @@ namespace crypto {
 
       int final_outlen;
       int update_outlen;
+
+      if (!aad.empty()) {
+        int aad_outlen;
+        if (EVP_EncryptUpdate(encrypt_ctx.get(), nullptr, &aad_outlen,
+                              reinterpret_cast<const std::uint8_t *>(aad.data()),
+                              static_cast<int>(aad.size())) != 1) {
+          return -1;
+        }
+      }
 
       // Encrypt into the caller's buffer
       if (EVP_EncryptUpdate(encrypt_ctx.get(), ciphertext, &update_outlen, (const std::uint8_t *) plaintext.data(), (int) plaintext.size()) != 1) {
@@ -217,7 +245,7 @@ namespace crypto {
 
     int gcm_t::encrypt(const std::string_view &plaintext, std::uint8_t *tagged_cipher, aes_t *iv) {
       // This overload handles the common case of [GCM tag][cipher text] buffer layout
-      return encrypt(plaintext, tagged_cipher, tagged_cipher + tag_size, iv);
+      return encrypt(plaintext, tagged_cipher, tagged_cipher + tag_size, iv, {});
     }
 
     int ecb_t::decrypt(const std::string_view &cipher, std::vector<std::uint8_t> &plaintext) {

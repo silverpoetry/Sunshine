@@ -290,6 +290,7 @@ namespace platf {
     constexpr caps_t controller_touch = 0x02;  // Controller touch events
     constexpr caps_t touchpad = 0x10;  // Native precision touchpad events
     constexpr caps_t touchpad_frame = 0x20;  // Native precision touchpad frame events
+    constexpr caps_t microphone_uplink = 0x40;  // Secure microphone uplink
   };  // namespace platform_caps
 
   struct cursor_info_t {
@@ -615,6 +616,14 @@ namespace platf {
     virtual ~mic_t() = default;
   };
 
+  class audio_input_sink_t {
+  public:
+    virtual bool write(const std::int16_t *samples, std::size_t frame_count) = 0;
+    virtual void flush() = 0;
+
+    virtual ~audio_input_sink_t() = default;
+  };
+
   class audio_control_t {
   public:
     virtual int set_sink(const std::string &sink) = 0;
@@ -645,6 +654,18 @@ namespace platf {
   std::pair<std::uint16_t, std::string> from_sockaddr_ex(const sockaddr *const);
 
   std::unique_ptr<audio_control_t> audio_control();
+
+  /**
+   * Create a 48 kHz, mono, signed 16-bit PCM sink backed by a preinstalled
+   * virtual microphone device. Implementations must not change the system's
+   * default input device or install drivers.
+   */
+  std::unique_ptr<audio_input_sink_t> microphone_sink(const std::string &device_name);
+
+  /**
+   * Check whether the configured virtual microphone render endpoint exists.
+   */
+  bool microphone_sink_supported(const std::string &device_name);
 
   /**
    * @brief Get the display_t instance for the given hwdevice_type.

@@ -2319,6 +2319,11 @@ namespace platf {
       BOOST_LOG(warning) << "Touchpad input requires Windows 11 CreateSyntheticPointerDevice2 support"sv;
     }
 
+    if (config::audio.microphone_uplink &&
+        microphone_sink_supported(config::audio.microphone_sink)) {
+      caps |= platform_caps::microphone_uplink;
+    }
+
     return caps;
   }
 }  // namespace platf
