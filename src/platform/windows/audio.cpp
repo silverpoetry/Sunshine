@@ -10,10 +10,15 @@
 // platform includes
 #include <Audioclient.h>
 #include <avrt.h>
+#include <mfapi.h>
+#include <mferror.h>
+#include <mfidl.h>
+#include <mftransform.h>
 #include <mmdeviceapi.h>
 #include <newdev.h>
 #include <roapi.h>
 #include <synchapi.h>
+#include <wmcodecdsp.h>
 
 // local includes
 #include "src/config.h"
@@ -223,6 +228,10 @@ namespace platf::audio {
   using audio_client_t = util::safe_ptr<IAudioClient, Release<IAudioClient>>;
   using audio_capture_t = util::safe_ptr<IAudioCaptureClient, Release<IAudioCaptureClient>>;
   using audio_render_t = util::safe_ptr<IAudioRenderClient, Release<IAudioRenderClient>>;
+  using mf_buffer_t = util::safe_ptr<IMFMediaBuffer, Release<IMFMediaBuffer>>;
+  using mf_media_type_t = util::safe_ptr<IMFMediaType, Release<IMFMediaType>>;
+  using mf_sample_t = util::safe_ptr<IMFSample, Release<IMFSample>>;
+  using mf_transform_t = util::safe_ptr<IMFTransform, Release<IMFTransform>>;
   using wave_format_t = util::safe_ptr<WAVEFORMATEX, co_task_free<WAVEFORMATEX>>;
   using wstring_t = util::safe_ptr<WCHAR, co_task_free<WCHAR>>;
   using handle_t = util::safe_ptr_v2<void, BOOL, CloseHandle>;
@@ -1216,8 +1225,14 @@ namespace platf::audio {
       return false;
     }
 
+    bool is_steam_microphone_endpoint(const wchar_t *adapter_name) {
+      return adapter_name &&
+             equal_insensitive(adapter_name, L"Steam Streaming Microphone"sv);
+    }
+
     device_t find_microphone_endpoint(device_enum_t &enumerator,
-                                      const std::string &configured_name) {
+                                      const std::string &configured_name,
+                                      bool *is_steam = nullptr) {
       collection_t collection;
       if (FAILED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection))) {
         return nullptr;
@@ -1250,11 +1265,201 @@ namespace platf::audio {
               friendly_name.prop.vt == VT_LPWSTR ? friendly_name.prop.pwszVal : nullptr,
               adapter_name.prop.vt == VT_LPWSTR ? adapter_name.prop.pwszVal : nullptr,
               description.prop.vt == VT_LPWSTR ? description.prop.pwszVal : nullptr)) {
+          if (is_steam) {
+            *is_steam = adapter_name.prop.vt == VT_LPWSTR &&
+                        is_steam_microphone_endpoint(adapter_name.prop.pwszVal);
+          }
           return device;
         }
       }
       return nullptr;
     }
+
+    class microphone_resampler_t {
+    public:
+      bool init() {
+        if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) {
+          return false;
+        }
+        media_foundation_started = true;
+
+        if (FAILED(CoCreateInstance(
+              CLSID_CResamplerMediaObject, nullptr, CLSCTX_INPROC_SERVER,
+              IID_IMFTransform, reinterpret_cast<void **>(&transform)))) {
+          return false;
+        }
+
+        mf_media_type_t input_type;
+        mf_media_type_t output_type;
+        if (!create_media_type(ML_MICROPHONE_SAMPLE_RATE, input_type) ||
+            !create_media_type(steam_microphone_sample_rate, output_type) ||
+            FAILED(transform->SetInputType(0, input_type.get(), 0)) ||
+            FAILED(transform->SetOutputType(0, output_type.get(), 0)) ||
+            FAILED(transform->GetOutputStreamInfo(0, &output_stream_info)) ||
+            FAILED(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)) ||
+            FAILED(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0))) {
+          return false;
+        }
+        return true;
+      }
+
+      bool process(const std::int16_t *samples, std::size_t frame_count,
+                   std::vector<std::int16_t> &output) {
+        output.clear();
+
+        mf_sample_t input_sample;
+        mf_buffer_t input_buffer;
+        const auto input_bytes = static_cast<DWORD>(frame_count * sizeof(*samples));
+        if (FAILED(MFCreateSample(&input_sample)) ||
+            FAILED(MFCreateMemoryBuffer(input_bytes, &input_buffer))) {
+          return false;
+        }
+
+        BYTE *buffer_data = nullptr;
+        if (FAILED(input_buffer->Lock(&buffer_data, nullptr, nullptr))) {
+          return false;
+        }
+        std::memcpy(buffer_data, samples, input_bytes);
+        if (FAILED(input_buffer->Unlock())) {
+          return false;
+        }
+
+        if (FAILED(input_buffer->SetCurrentLength(input_bytes)) ||
+            FAILED(input_sample->AddBuffer(input_buffer.get()))) {
+          return false;
+        }
+
+        auto status = transform->ProcessInput(0, input_sample.get(), 0);
+        if (status == MF_E_NOTACCEPTING) {
+          if (!read_available_output(output)) {
+            return false;
+          }
+          status = transform->ProcessInput(0, input_sample.get(), 0);
+        }
+        return SUCCEEDED(status) && read_available_output(output);
+      }
+
+      bool drain(std::vector<std::int16_t> &output) {
+        output.clear();
+        if (FAILED(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)) ||
+            FAILED(transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0))) {
+          return false;
+        }
+        return read_available_output(output);
+      }
+
+      ~microphone_resampler_t() {
+        transform.reset();
+        if (media_foundation_started) {
+          MFShutdown();
+        }
+      }
+
+    private:
+      static constexpr DWORD steam_microphone_sample_rate = 44100;
+
+      bool create_media_type(DWORD sample_rate, mf_media_type_t &media_type) {
+        if (FAILED(MFCreateMediaType(&media_type))) {
+          return false;
+        }
+
+        return SUCCEEDED(media_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio)) &&
+               SUCCEEDED(media_type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM)) &&
+               SUCCEEDED(media_type->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 1)) &&
+               SUCCEEDED(media_type->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate)) &&
+               SUCCEEDED(media_type->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, sizeof(std::int16_t))) &&
+               SUCCEEDED(media_type->SetUINT32(
+                 MF_MT_AUDIO_AVG_BYTES_PER_SECOND, sample_rate * sizeof(std::int16_t))) &&
+               SUCCEEDED(media_type->SetUINT32(
+                 MF_MT_AUDIO_BITS_PER_SAMPLE, sizeof(std::int16_t) * 8)) &&
+               SUCCEEDED(media_type->SetUINT32(
+                 MF_MT_AUDIO_CHANNEL_MASK, SPEAKER_FRONT_CENTER)) &&
+               SUCCEEDED(media_type->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE));
+      }
+
+      bool read_available_output(std::vector<std::int16_t> &output) {
+        while (true) {
+          mf_sample_t supplied_sample;
+          mf_buffer_t supplied_buffer;
+          const bool transform_provides_samples =
+            (output_stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
+
+          if (!transform_provides_samples) {
+            const auto buffer_size = std::max<DWORD>(
+              output_stream_info.cbSize, ML_MICROPHONE_FRAME_SAMPLES * sizeof(std::int16_t) * 2);
+            if (FAILED(MFCreateSample(&supplied_sample)) ||
+                FAILED(MFCreateMemoryBuffer(buffer_size, &supplied_buffer)) ||
+                FAILED(supplied_sample->AddBuffer(supplied_buffer.get()))) {
+              return false;
+            }
+          }
+
+          MFT_OUTPUT_DATA_BUFFER output_data {};
+          output_data.dwStreamID = 0;
+          output_data.pSample = supplied_sample.get();
+          DWORD process_status = 0;
+          const auto status = transform->ProcessOutput(
+            0, 1, &output_data, &process_status);
+
+          if (output_data.pEvents) {
+            output_data.pEvents->Release();
+          }
+          if (status == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            return true;
+          }
+          if (FAILED(status) || !output_data.pSample) {
+            if (transform_provides_samples && output_data.pSample) {
+              output_data.pSample->Release();
+            }
+            return false;
+          }
+
+          mf_buffer_t contiguous_buffer;
+          const auto buffer_status =
+            output_data.pSample->ConvertToContiguousBuffer(&contiguous_buffer);
+          if (FAILED(buffer_status)) {
+            if (transform_provides_samples) {
+              output_data.pSample->Release();
+            }
+            return false;
+          }
+
+          BYTE *buffer_data = nullptr;
+          DWORD buffer_length = 0;
+          if (FAILED(contiguous_buffer->Lock(&buffer_data, nullptr, &buffer_length))) {
+            if (transform_provides_samples) {
+              output_data.pSample->Release();
+            }
+            return false;
+          }
+          if (buffer_length % sizeof(std::int16_t) != 0) {
+            contiguous_buffer->Unlock();
+            if (transform_provides_samples) {
+              output_data.pSample->Release();
+            }
+            return false;
+          }
+
+          const auto previous_size = output.size();
+          output.resize(previous_size + buffer_length / sizeof(std::int16_t));
+          std::memcpy(output.data() + previous_size, buffer_data, buffer_length);
+          if (FAILED(contiguous_buffer->Unlock())) {
+            if (transform_provides_samples) {
+              output_data.pSample->Release();
+            }
+            return false;
+          }
+
+          if (transform_provides_samples) {
+            output_data.pSample->Release();
+          }
+        }
+      }
+
+      bool media_foundation_started {};
+      mf_transform_t transform;
+      MFT_OUTPUT_STREAM_INFO output_stream_info {};
+    };
 
     class microphone_sink_wasapi_t final: public ::platf::audio_input_sink_t {
     public:
@@ -1270,7 +1475,8 @@ namespace platf::audio {
           return false;
         }
 
-        auto device = find_microphone_endpoint(enumerator, configured_name);
+        auto device = find_microphone_endpoint(
+          enumerator, configured_name, &steam_microphone_endpoint);
         if (!device ||
             FAILED(device->Activate(
               IID_IAudioClient, CLSCTX_ALL, nullptr,
@@ -1278,9 +1484,64 @@ namespace platf::audio {
           return false;
         }
 
+        if (steam_microphone_endpoint) {
+          return init_steam_microphone();
+        }
+        return init_standard_endpoint();
+      }
+
+      bool write(const std::int16_t *samples, std::size_t frame_count) override {
+        if (!steam_microphone_endpoint) {
+          return write_output(samples, frame_count);
+        }
+
+        std::vector<std::int16_t> resampled;
+        return resampler.process(samples, frame_count, resampled) &&
+               write_output(resampled.data(), resampled.size());
+      }
+
+      void flush() override {
+        if (!started) {
+          return;
+        }
+
+        if (steam_microphone_endpoint) {
+          std::vector<std::int16_t> resampled;
+          if (resampler.drain(resampled)) {
+            write_output(resampled.data(), resampled.size());
+          }
+        }
+
+        // Give the audio engine a bounded opportunity to consume queued
+        // samples. Reset() would discard the microphone tail.
+        for (int attempt = 0; attempt < 20; ++attempt) {
+          UINT32 padding = 0;
+          if (FAILED(client->GetCurrentPadding(&padding)) || padding == 0) {
+            break;
+          }
+          wait_for_buffer(20);
+        }
+      }
+
+      ~microphone_sink_wasapi_t() override {
+        if (started) {
+          client->Stop();
+        }
+      }
+
+    private:
+      bool init_standard_endpoint() {
+        wave_format_t mix_format;
+        if (FAILED(client->GetMixFormat(&mix_format)) ||
+            (mix_format->nChannels != 1 && mix_format->nChannels != 2)) {
+          BOOST_LOG(error) << "Virtual microphone endpoint must use a mono or stereo mix format"sv;
+          return false;
+        }
+        channel_count = mix_format->nChannels;
+
         WAVEFORMATEX format {};
         format.wFormatTag = WAVE_FORMAT_PCM;
-        format.nChannels = 1;
+        format.nChannels = channel_count;
         format.nSamplesPerSec = ML_MICROPHONE_SAMPLE_RATE;
         format.wBitsPerSample = 16;
         format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
@@ -1303,11 +1564,43 @@ namespace platf::audio {
         }
 
         started = true;
-        BOOST_LOG(info) << "Virtual microphone sink opened at 48 kHz mono PCM"sv;
+        BOOST_LOG(info) << "Virtual microphone sink opened at 48 kHz, "sv
+                        << channel_count << "-channel PCM (endpoint mix: "
+                        << mix_format->nSamplesPerSec << " Hz, "
+                        << mix_format->nChannels << " channels)"sv;
         return true;
       }
 
-      bool write(const std::int16_t *samples, std::size_t frame_count) override {
+      bool init_steam_microphone() {
+        constexpr REFERENCE_TIME buffer_duration = 1000000;  // 100 ms
+
+        WAVEFORMATEX format {};
+        format.wFormatTag = WAVE_FORMAT_PCM;
+        format.nChannels = 2;
+        format.nSamplesPerSec = 44100;
+        format.wBitsPerSample = 16;
+        format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
+        format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+
+        channel_count = format.nChannels;
+        if (!resampler.init() ||
+            FAILED(client->Initialize(
+              AUDCLNT_SHAREMODE_EXCLUSIVE, 0,
+              buffer_duration, 0, &format, nullptr)) ||
+            FAILED(client->GetBufferSize(&buffer_frames)) ||
+            FAILED(client->GetService(
+              IID_IAudioRenderClient, reinterpret_cast<void **>(&render))) ||
+            FAILED(client->Start())) {
+          return false;
+        }
+
+        started = true;
+        BOOST_LOG(info) << "Steam virtual microphone sink opened at 44.1 kHz stereo PCM "
+                           "with high-quality 48 kHz input resampling"sv;
+        return true;
+      }
+
+      bool write_output(const std::int16_t *samples, std::size_t frame_count) {
         while (frame_count != 0) {
           UINT32 padding = 0;
           if (FAILED(client->GetCurrentPadding(&padding)) || padding > buffer_frames) {
@@ -1316,7 +1609,7 @@ namespace platf::audio {
 
           const auto available = buffer_frames - padding;
           if (available == 0) {
-            if (WaitForSingleObject(event.get(), 1000) != WAIT_OBJECT_0) {
+            if (!wait_for_buffer(1000)) {
               return false;
             }
             continue;
@@ -1328,7 +1621,15 @@ namespace platf::audio {
           if (FAILED(render->GetBuffer(chunk, &output))) {
             return false;
           }
-          std::memcpy(output, samples, chunk * sizeof(*samples));
+          if (channel_count == 1) {
+            std::memcpy(output, samples, chunk * sizeof(*samples));
+          } else {
+            auto *output_samples = reinterpret_cast<std::int16_t *>(output);
+            for (UINT32 frame = 0; frame < chunk; ++frame) {
+              output_samples[frame * 2] = samples[frame];
+              output_samples[frame * 2 + 1] = samples[frame];
+            }
+          }
           if (FAILED(render->ReleaseBuffer(chunk, 0))) {
             return false;
           }
@@ -1338,35 +1639,25 @@ namespace platf::audio {
         return true;
       }
 
-      void flush() override {
-        if (!started) {
-          return;
+      bool wait_for_buffer(DWORD timeout_ms) {
+        if (event) {
+          return WaitForSingleObject(event.get(), timeout_ms) == WAIT_OBJECT_0;
         }
 
-        // Give the shared-mode engine a bounded opportunity to consume queued
-        // samples. Reset() would discard the microphone tail.
-        for (int attempt = 0; attempt < 20; ++attempt) {
-          UINT32 padding = 0;
-          if (FAILED(client->GetCurrentPadding(&padding)) || padding == 0) {
-            break;
-          }
-          WaitForSingleObject(event.get(), 20);
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+          std::min<DWORD>(timeout_ms, 2)));
+        return true;
       }
 
-      ~microphone_sink_wasapi_t() override {
-        if (started) {
-          client->Stop();
-        }
-      }
-
-    private:
       thread_com_t com;
       device_enum_t enumerator;
       audio_client_t client;
       audio_render_t render;
+      microphone_resampler_t resampler;
       handle_t event;
       UINT32 buffer_frames {};
+      WORD channel_count {};
+      bool steam_microphone_endpoint {};
       bool started {};
     };
   }  // namespace
