@@ -23,6 +23,7 @@
 // local includes
 #include "config.h"
 #include "clipboard_blob_store.h"
+#include "clipboard_file_store.h"
 #include "display_device.h"
 #include "file_handler.h"
 #include "globals.h"
@@ -1106,6 +1107,74 @@ namespace nvhttp {
       return output;
     }
 
+    bool parse_digest_hex(std::string_view value, clipboard_file_store::digest_t &digest) {
+      if (value.size() != digest.size() * 2) {
+        return false;
+      }
+      auto nibble = [](char character) -> int {
+        if (character >= '0' && character <= '9') {
+          return character - '0';
+        }
+        if (character >= 'a' && character <= 'f') {
+          return character - 'a' + 10;
+        }
+        if (character >= 'A' && character <= 'F') {
+          return character - 'A' + 10;
+        }
+        return -1;
+      };
+      for (std::size_t index = 0; index < digest.size(); index++) {
+        const int high = nibble(value[index * 2]);
+        const int low = nibble(value[index * 2 + 1]);
+        if (high < 0 || low < 0) {
+          return false;
+        }
+        digest[index] = static_cast<std::uint8_t>((high << 4) | low);
+      }
+      return true;
+    }
+
+    bool read_bounded_body(const req_https_t &request,
+                           std::size_t max_size,
+                           std::vector<std::uint8_t> &bytes) {
+      auto length_header = request->header.find("Content-Length");
+      std::uint64_t content_length {};
+      if (length_header == request->header.end() ||
+          !parse_decimal_u64(length_header->second, content_length) ||
+          content_length == 0 ||
+          content_length > max_size) {
+        return false;
+      }
+
+      bytes.reserve(static_cast<std::size_t>(content_length));
+      std::istreambuf_iterator<char> begin(request->content);
+      std::istreambuf_iterator<char> end;
+      for (auto position = begin; position != end; ++position) {
+        if (bytes.size() == content_length) {
+          return false;
+        }
+        bytes.push_back(static_cast<std::uint8_t>(*position));
+      }
+      return bytes.size() == content_length;
+    }
+
+    bool valid_clipboard_idempotency_key(const req_https_t &request, std::string &key) {
+      auto header = request->header.find("X-Clipboard-Idempotency-Key");
+      if (header == request->header.end() ||
+          header->second.empty() ||
+          header->second.size() > 128 ||
+          !std::all_of(header->second.begin(), header->second.end(), [](unsigned char character) {
+            return std::isalnum(character) != 0 ||
+                   character == '-' ||
+                   character == '_' ||
+                   character == '.';
+          })) {
+        return false;
+      }
+      key = header->second;
+      return true;
+    }
+
     template <typename Response>
     void write_clipboard_json(Response response, SimpleWeb::StatusCode status, std::string body) {
       SimpleWeb::CaseInsensitiveMultimap headers;
@@ -1243,6 +1312,201 @@ namespace nvhttp {
       std::string body(reinterpret_cast<const char *>(blob.bytes.data()), blob.bytes.size());
       response->write(SimpleWeb::StatusCode::success_ok, std::move(body), headers);
     }
+
+    void begin_clipboard_file_upload(resp_https_t response, req_https_t request) {
+      std::uint64_t origin_id {};
+      std::string idempotency_key;
+      std::vector<std::uint8_t> manifest;
+      if (!validate_clipboard_origin(request, origin_id)) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_forbidden,
+                             R"({"error":"inactive_clipboard_session"})");
+        return;
+      }
+      if (!valid_clipboard_idempotency_key(request, idempotency_key) ||
+          !read_bounded_body(request, LI_CLIPBOARD_MAX_FILE_MANIFEST_BYTES, manifest)) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_bad_request,
+                             R"({"error":"invalid_manifest_request"})");
+        return;
+      }
+
+      auto result = clipboard_file_store::begin_upload(std::move(manifest),
+                                                       origin_id,
+                                                       std::move(idempotency_key));
+      if (!result.ok) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_bad_request,
+                             std::format(R"({{"error":"{}"}})", result.error));
+        return;
+      }
+      write_clipboard_json(response,
+                           SimpleWeb::StatusCode::success_ok,
+                           std::format(
+                             R"({{"id":"{}","size":{},"sha256":"{}","expires_in":{}}})",
+                             result.id,
+                             result.manifest_size,
+                             digest_hex(result.manifest_sha256),
+                             clipboard_file_store::pending_ttl_seconds));
+    }
+
+    void upload_clipboard_file_chunk(resp_https_t response, req_https_t request) {
+      std::uint64_t origin_id {};
+      std::uint64_t file_index_u64 {};
+      std::uint64_t offset {};
+      std::vector<std::uint8_t> bytes;
+      clipboard_file_store::digest_t digest {};
+
+      auto offset_header = request->header.find("X-Clipboard-Offset");
+      auto digest_header = request->header.find("X-Clipboard-SHA256");
+      if (!validate_clipboard_origin(request, origin_id)) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_forbidden,
+                             R"({"error":"inactive_clipboard_session"})");
+        return;
+      }
+      if (request->path_match.size() < 3 ||
+          !parse_decimal_u64(request->path_match[2].str(), file_index_u64) ||
+          file_index_u64 > UINT32_MAX ||
+          offset_header == request->header.end() ||
+          !parse_decimal_u64(offset_header->second, offset) ||
+          digest_header == request->header.end() ||
+          !parse_digest_hex(digest_header->second, digest) ||
+          !read_bounded_body(request, clipboard_file_store::max_chunk_bytes, bytes)) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_bad_request,
+                             R"({"error":"invalid_chunk_request"})");
+        return;
+      }
+
+      auto result = clipboard_file_store::write_chunk(
+        request->path_match[1].str(),
+        origin_id,
+        static_cast<std::uint32_t>(file_index_u64),
+        offset,
+        bytes,
+        digest
+      );
+      if (!result.ok) {
+        write_clipboard_json(response,
+                             result.error == "not_found" ?
+                               SimpleWeb::StatusCode::client_error_not_found :
+                               SimpleWeb::StatusCode::client_error_conflict,
+                             std::format(R"({{"error":"{}"}})", result.error));
+        return;
+      }
+      write_clipboard_json(response, SimpleWeb::StatusCode::success_ok, R"({"ok":true})");
+    }
+
+    void complete_clipboard_file_upload(resp_https_t response, req_https_t request) {
+      std::uint64_t origin_id {};
+      if (!validate_clipboard_origin(request, origin_id)) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_forbidden,
+                             R"({"error":"inactive_clipboard_session"})");
+        return;
+      }
+      auto result = clipboard_file_store::complete_upload(
+        request->path_match.size() >= 2 ? request->path_match[1].str() : std::string {},
+        origin_id
+      );
+      if (!result.ok) {
+        write_clipboard_json(response,
+                             result.error == "not_found" ?
+                               SimpleWeb::StatusCode::client_error_not_found :
+                               SimpleWeb::StatusCode::client_error_conflict,
+                             std::format(R"({{"error":"{}"}})", result.error));
+        return;
+      }
+      write_clipboard_json(response, SimpleWeb::StatusCode::success_ok, R"({"ok":true})");
+    }
+
+    void download_clipboard_file_manifest(resp_https_t response, req_https_t request) {
+      std::uint64_t origin_id {};
+      if (!validate_clipboard_origin(request, origin_id)) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_forbidden,
+                             R"({"error":"inactive_clipboard_session"})");
+        return;
+      }
+      (void) origin_id;
+
+      auto result = clipboard_file_store::get_manifest(
+        request->path_match.size() >= 2 ? request->path_match[1].str() : std::string {}
+      );
+      if (!result.found) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_not_found,
+                             R"({"error":"not_found"})");
+        return;
+      }
+
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", "application/vnd.moonlight.file-manifest");
+      headers.emplace("Content-Length", std::to_string(result.bytes.size()));
+      headers.emplace("X-Clipboard-SHA256", digest_hex(result.sha256));
+      headers.emplace("X-Content-Type-Options", "nosniff");
+      headers.emplace("Cache-Control", "no-store");
+      std::string body(reinterpret_cast<const char *>(result.bytes.data()), result.bytes.size());
+      response->write(SimpleWeb::StatusCode::success_ok, std::move(body), headers);
+    }
+
+    void download_clipboard_file_chunk(resp_https_t response, req_https_t request) {
+      std::uint64_t origin_id {};
+      std::uint64_t file_index_u64 {};
+      std::uint64_t offset {};
+      std::uint64_t length {};
+      if (!validate_clipboard_origin(request, origin_id)) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_forbidden,
+                             R"({"error":"inactive_clipboard_session"})");
+        return;
+      }
+      (void) origin_id;
+
+      const auto query = request->parse_query_string();
+      const auto offset_position = query.find("offset");
+      const auto length_position = query.find("length");
+      if (request->path_match.size() < 3 ||
+          !parse_decimal_u64(request->path_match[2].str(), file_index_u64) ||
+          file_index_u64 > UINT32_MAX ||
+          offset_position == query.end() ||
+          !parse_decimal_u64(offset_position->second, offset) ||
+          length_position == query.end() ||
+          !parse_decimal_u64(length_position->second, length) ||
+          length == 0 ||
+          length > clipboard_file_store::max_chunk_bytes) {
+        write_clipboard_json(response,
+                             SimpleWeb::StatusCode::client_error_bad_request,
+                             R"({"error":"invalid_range"})");
+        return;
+      }
+
+      auto result = clipboard_file_store::read_chunk(
+        request->path_match[1].str(),
+        static_cast<std::uint32_t>(file_index_u64),
+        offset,
+        static_cast<std::size_t>(length)
+      );
+      if (!result.ok) {
+        write_clipboard_json(response,
+                             result.error == "not_found" ?
+                               SimpleWeb::StatusCode::client_error_not_found :
+                               SimpleWeb::StatusCode::client_error_conflict,
+                             std::format(R"({{"error":"{}"}})", result.error));
+        return;
+      }
+
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", "application/octet-stream");
+      headers.emplace("Content-Length", std::to_string(result.bytes.size()));
+      headers.emplace("X-Clipboard-SHA256", digest_hex(result.sha256));
+      headers.emplace("X-Clipboard-Offset", std::to_string(offset));
+      headers.emplace("X-Content-Type-Options", "nosniff");
+      headers.emplace("Cache-Control", "no-store");
+      std::string body(reinterpret_cast<const char *>(result.bytes.data()), result.bytes.size());
+      response->write(SimpleWeb::StatusCode::success_ok, std::move(body), headers);
+    }
   }  // namespace
 
   void start() {
@@ -1357,6 +1621,11 @@ namespace nvhttp {
     https_server.resource["^/cancel$"]["GET"] = cancel;
     https_server.resource["^/api/v2/clipboard/blobs$"]["POST"] = upload_clipboard_blob;
     https_server.resource["^/api/v2/clipboard/blobs/([0-9a-f\\-]{36})$"]["GET"] = download_clipboard_blob;
+    https_server.resource["^/api/v2/clipboard/files$"]["POST"] = begin_clipboard_file_upload;
+    https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/([0-9]+)$"]["POST"] = upload_clipboard_file_chunk;
+    https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/complete$"]["POST"] = complete_clipboard_file_upload;
+    https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/manifest$"]["GET"] = download_clipboard_file_manifest;
+    https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/([0-9]+)$"]["GET"] = download_clipboard_file_chunk;
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);

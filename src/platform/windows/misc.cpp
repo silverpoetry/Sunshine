@@ -33,6 +33,8 @@
 #include <WS2tcpip.h>
 #include <WtsApi32.h>
 #include <sddl.h>
+#include <shellapi.h>
+#include <shlobj.h>
 // clang-format on
 
 // Boost overrides NTDDI_VERSION, so we re-override it here
@@ -2307,7 +2309,10 @@ namespace platf {
   }  // namespace
 
   std::uint8_t clipboard_capabilities() {
-    return LI_CLIPBOARD_CAP_TEXT | LI_CLIPBOARD_CAP_PNG | LI_CLIPBOARD_CAP_BLOB;
+    return LI_CLIPBOARD_CAP_TEXT |
+           LI_CLIPBOARD_CAP_PNG |
+           LI_CLIPBOARD_CAP_BLOB |
+           LI_CLIPBOARD_CAP_FILES;
   }
 
   std::uint64_t clipboard_sequence() {
@@ -2324,6 +2329,34 @@ namespace platf {
     auto close_clipboard = util::fail_guard([]() {
       CloseClipboard();
     });
+
+    if ((allowed_capabilities & LI_CLIPBOARD_CAP_FILES) != 0 &&
+        IsClipboardFormatAvailable(CF_HDROP)) {
+      const auto drop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
+      const UINT count = drop ? DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0) : 0;
+      if (count != 0 && count <= LI_CLIPBOARD_MAX_FILE_ENTRIES) {
+        content.paths.reserve(count);
+        for (UINT index = 0; index < count; index++) {
+          const UINT length = DragQueryFileW(drop, index, nullptr, 0);
+          if (length == 0) {
+            content.paths.clear();
+            break;
+          }
+          std::wstring path(length + 1, L'\0');
+          if (DragQueryFileW(drop, index, path.data(), length + 1) != length) {
+            content.paths.clear();
+            break;
+          }
+          path.resize(length);
+          content.paths.emplace_back(std::move(path));
+        }
+        if (content.paths.size() == count) {
+          content.mime_type = LI_CLIPBOARD_MIME_FILE_MANIFEST;
+          read_clipboard_identity(content);
+          return true;
+        }
+      }
+    }
 
     if ((allowed_capabilities & LI_CLIPBOARD_CAP_PNG) != 0 &&
         IsClipboardFormatAvailable(clipboard_png_format())) {
@@ -2419,7 +2452,44 @@ namespace platf {
     }
 
     bool content_written = false;
-    if (content.mime_type == LI_CLIPBOARD_MIME_TEXT_UTF8 &&
+    if (content.mime_type == LI_CLIPBOARD_MIME_FILE_MANIFEST &&
+        !content.paths.empty() &&
+        content.paths.size() <= LI_CLIPBOARD_MAX_FILE_ENTRIES) {
+      std::vector<std::wstring> paths;
+      std::size_t bytes = sizeof(DROPFILES) + sizeof(wchar_t);
+      paths.reserve(content.paths.size());
+      for (const auto &path : content.paths) {
+        std::error_code error;
+        auto absolute = std::filesystem::absolute(path, error);
+        if (error || !std::filesystem::exists(absolute, error) || error) {
+          paths.clear();
+          break;
+        }
+        auto wide = absolute.wstring();
+        if (wide.empty() ||
+            bytes > 4ULL * 1024ULL * 1024ULL - (wide.size() + 1) * sizeof(wchar_t)) {
+          paths.clear();
+          break;
+        }
+        bytes += (wide.size() + 1) * sizeof(wchar_t);
+        paths.push_back(std::move(wide));
+      }
+
+      if (!paths.empty()) {
+        std::vector<std::uint8_t> drop_data(bytes, 0);
+        auto drop_files = reinterpret_cast<DROPFILES *>(drop_data.data());
+        drop_files->pFiles = sizeof(DROPFILES);
+        drop_files->fWide = TRUE;
+        auto destination = reinterpret_cast<wchar_t *>(drop_data.data() + sizeof(DROPFILES));
+        for (const auto &path : paths) {
+          std::copy(path.begin(), path.end(), destination);
+          destination += path.size() + 1;
+        }
+        content_written = set_global_clipboard_data(CF_HDROP,
+                                                    drop_data.data(),
+                                                    drop_data.size());
+      }
+    } else if (content.mime_type == LI_CLIPBOARD_MIME_TEXT_UTF8 &&
         content.data.size() <= LI_CLIPBOARD_MAX_TEXT_BYTES &&
         LiIsValidUtf8ClipboardText(content.data.data(), content.data.size())) {
       try {
