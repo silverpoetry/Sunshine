@@ -24,7 +24,7 @@ namespace stream {
   struct session_t;
 
   // Used by the certificate-authenticated clipboard blob endpoint to ensure
-  // requests are tied to a live Clipboard v2 negotiation that included BLOB.
+  // requests are tied to a live clipboard negotiation that included BLOB.
   bool is_clipboard_origin_active(std::uint64_t origin_id);
 
   // File endpoints additionally require negotiated streamed-file support.
