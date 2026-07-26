@@ -373,29 +373,10 @@ namespace platf::dxgi {
     std::uint64_t helper_frame_received_qpc {};
     std::uint64_t helper_frame_acquired_qpc {};
     std::uint64_t helper_next_request_id {};
-    std::uint64_t trace_producer_drops {};
-    std::uint64_t trace_window_start_us {};
-    std::uint64_t trace_last_consume_us {};
-    std::uint64_t trace_last_frame_qpc {};
-    std::uint64_t trace_source_gap_total_us {};
-    std::uint64_t trace_source_gap_max_us {};
-    std::uint64_t trace_consume_gap_max_us {};
-    std::uint64_t trace_age_total_us {};
-    std::uint64_t trace_age_max_us {};
-    std::uint64_t trace_ipc_max_us {};
-    std::uint64_t trace_mutex_max_us {};
-    std::uint64_t trace_helper_last_sequence {};
-    std::uint32_t trace_frames {};
-    std::uint32_t trace_source_intervals {};
-    std::uint32_t trace_window_producer_drops {};
-    std::uint32_t trace_helper_skips {};
 
     void on_frame_arrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const &sender, winrt::Windows::Foundation::IInspectable const &);
     int init_helper(display_base_t *display, const ::video::config_t &config);
     capture_e next_helper_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time);
-    void trace_frame(std::uint64_t frame_qpc, std::uint64_t helper_sequence,
-                     std::uint64_t helper_send_qpc, std::uint64_t received_qpc,
-                     std::uint64_t acquired_qpc, std::uint64_t producer_drops);
     void stop_helper();
 
   public:

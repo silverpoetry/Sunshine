@@ -9,7 +9,6 @@
 
 // standard includes
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <limits>
 #include <mutex>
@@ -739,15 +738,6 @@ namespace platf {
     std::uint64_t touchpadRepeatGeneration {};
     thread_pool_util::ThreadPool::task_id_t touchpadRepeatTask {};
     std::mutex touchpadMutex;
-    std::uint64_t touchpadTraceWindowStartUs {};
-    std::uint64_t touchpadTraceLastUpdateUs {};
-    std::uint64_t touchpadTraceGapMaxUs {};
-    std::uint64_t touchpadTraceCallTotalUs {};
-    std::uint64_t touchpadTraceCallMaxUs {};
-    std::uint32_t touchpadTraceFrames {};
-    std::uint32_t touchpadTraceFailures {};
-    std::uint8_t touchpadTraceFirstSequence {};
-    std::uint8_t touchpadTraceLastSequence {};
   };
 
   /**
@@ -1345,85 +1335,6 @@ namespace platf {
     return true;
   }
 
-  std::uint64_t
-    touchpad_trace_time_us() {
-    return std::chrono::duration_cast<std::chrono::microseconds>(
-             std::chrono::steady_clock::now().time_since_epoch()
-    ).count();
-  }
-
-  void
-    trace_touchpad_injection(
-      client_input_raw_t *raw,
-      const touchpad_frame_t &touchpad,
-      std::uint64_t start_us,
-      std::uint64_t end_us,
-      bool success
-    ) {
-    if (touchpad.traceClientTimeMs == 0) {
-      return;
-    }
-
-    if (raw->touchpadTraceWindowStartUs == 0) {
-      raw->touchpadTraceWindowStartUs = start_us;
-      raw->touchpadTraceFirstSequence = touchpad.traceSequence;
-    }
-
-    auto update_gap_us = raw->touchpadTraceLastUpdateUs == 0 ?
-                           0 :
-                           start_us - raw->touchpadTraceLastUpdateUs;
-    auto call_us = end_us - start_us;
-    raw->touchpadTraceLastUpdateUs = start_us;
-    raw->touchpadTraceGapMaxUs = std::max(raw->touchpadTraceGapMaxUs, update_gap_us);
-    raw->touchpadTraceCallTotalUs += call_us;
-    raw->touchpadTraceCallMaxUs = std::max(raw->touchpadTraceCallMaxUs, call_us);
-    raw->touchpadTraceFrames++;
-    raw->touchpadTraceFailures += success ? 0 : 1;
-    raw->touchpadTraceLastSequence = touchpad.traceSequence;
-
-    if (update_gap_us > 20000 || call_us > 20000 || !success) {
-      BOOST_LOG(info)
-        << "TPTRACE_WINDOWS_INJECT_GAP host_us="sv << end_us
-        << " seq="sv << static_cast<unsigned>(touchpad.traceSequence)
-        << " update_gap_ms="sv << update_gap_us / 1000.0
-        << " call_ms="sv << call_us / 1000.0
-        << " success="sv << success;
-    }
-
-    bool state_change = false;
-    for (std::uint8_t i = 0; i < touchpad.contactCount; i++) {
-      if (touchpad.contacts[i].eventType != LI_TOUCH_EVENT_MOVE) {
-        state_change = true;
-        break;
-      }
-    }
-
-    auto elapsed_us =
-      std::max<std::uint64_t>(end_us - raw->touchpadTraceWindowStartUs, 1);
-    if (elapsed_us >= 500000 || state_change) {
-      BOOST_LOG(info)
-        << "TPTRACE_WINDOWS_INJECT host_us="sv << end_us
-        << " window_ms="sv << elapsed_us / 1000.0
-        << " frames="sv << raw->touchpadTraceFrames
-        << " rate_hz="sv << raw->touchpadTraceFrames * 1000000.0 / elapsed_us
-        << " seq="sv << static_cast<unsigned>(raw->touchpadTraceFirstSequence)
-        << '-' << static_cast<unsigned>(raw->touchpadTraceLastSequence)
-        << " update_gap_max_ms="sv << raw->touchpadTraceGapMaxUs / 1000.0
-        << " call_avg_ms="sv
-        << raw->touchpadTraceCallTotalUs /
-             (1000.0 * std::max<std::uint32_t>(raw->touchpadTraceFrames, 1))
-        << " call_max_ms="sv << raw->touchpadTraceCallMaxUs / 1000.0
-        << " failures="sv << raw->touchpadTraceFailures;
-
-      raw->touchpadTraceWindowStartUs = end_us;
-      raw->touchpadTraceGapMaxUs = 0;
-      raw->touchpadTraceCallTotalUs = 0;
-      raw->touchpadTraceCallMaxUs = 0;
-      raw->touchpadTraceFrames = 0;
-      raw->touchpadTraceFailures = 0;
-    }
-  }
-
   void
     schedule_touchpad_repeat(client_input_raw_t *raw) {
     perform_touchpad_compaction(raw);
@@ -1474,7 +1385,6 @@ namespace platf {
   void
     touchpad_frame_update(client_input_t *input, const touchpad_frame_t &touchpad) {
     auto raw = (client_input_raw_t *) input;
-    auto trace_start_us = touchpad_trace_time_us();
 
     if (touchpad.contactCount > MAX_TOUCHPAD_FRAME_CONTACTS) {
       BOOST_LOG(warning) << "Touchpad frame contact count out of range ["sv << (uint32_t) touchpad.contactCount << ']';
@@ -1511,15 +1421,7 @@ namespace platf {
       );
     }
 
-    bool injected = inject_touchpad_frame(raw);
-    trace_touchpad_injection(
-      raw,
-      touchpad,
-      trace_start_us,
-      touchpad_trace_time_us(),
-      injected
-    );
-    if (!injected) {
+    if (!inject_touchpad_frame(raw)) {
       return;
     }
 

@@ -404,8 +404,6 @@ namespace platf {
     std::uint16_t rotation;  // Degrees (0..360) or LI_ROT_UNKNOWN
     std::uint16_t deviceWidthMm;
     std::uint16_t deviceHeightMm;
-    std::uint8_t traceSequence;
-    std::uint32_t traceClientTimeMs;
     std::array<touchpad_frame_contact_t, MAX_TOUCHPAD_FRAME_CONTACTS> contacts;
   };
 

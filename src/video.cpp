@@ -7,7 +7,6 @@
 #include <atomic>
 #include <algorithm>
 #include <bitset>
-#include <chrono>
 #include <list>
 #include <thread>
 
@@ -1413,58 +1412,10 @@ namespace video {
     platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
     bool capture_cursor = should_capture_cursor(capture_ctxs);
-    auto trace_capture_window_start = std::chrono::steady_clock::now();
-    auto trace_capture_last_callback = trace_capture_window_start;
-    std::uint32_t trace_capture_callbacks = 0;
-    std::uint32_t trace_capture_new_frames = 0;
-    std::uint64_t trace_capture_gap_max_us = 0;
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
-        auto trace_now = std::chrono::steady_clock::now();
-        auto trace_gap_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                              trace_now - trace_capture_last_callback
-        ).count();
-        trace_capture_last_callback = trace_now;
-        trace_capture_callbacks++;
-        trace_capture_new_frames += frame_captured ? 1 : 0;
-        trace_capture_gap_max_us = std::max<std::uint64_t>(
-          trace_capture_gap_max_us,
-          std::max<std::int64_t>(trace_gap_us, 0)
-        );
-        auto trace_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                  trace_now - trace_capture_window_start
-        ).count();
-        if (trace_gap_us > 20000) {
-          BOOST_LOG(info)
-            << "TPTRACE_VIDEO_CAPTURE_GAP host_us="sv
-            << std::chrono::duration_cast<std::chrono::microseconds>(
-                 trace_now.time_since_epoch()
-               ).count()
-            << " callback_gap_ms="sv << trace_gap_us / 1000.0
-            << " frame_captured="sv << frame_captured;
-        }
-        if (trace_elapsed_us >= 500000) {
-          BOOST_LOG(info)
-            << "TPTRACE_VIDEO_CAPTURE host_us="sv
-            << std::chrono::duration_cast<std::chrono::microseconds>(
-                 trace_now.time_since_epoch()
-               ).count()
-            << " window_ms="sv << trace_elapsed_us / 1000.0
-            << " callbacks="sv << trace_capture_callbacks
-            << " callback_hz="sv
-            << trace_capture_callbacks * 1000000.0 / trace_elapsed_us
-            << " new_frames="sv << trace_capture_new_frames
-            << " new_frame_hz="sv
-            << trace_capture_new_frames * 1000000.0 / trace_elapsed_us
-            << " callback_gap_max_ms="sv << trace_capture_gap_max_us / 1000.0;
-          trace_capture_window_start = trace_now;
-          trace_capture_callbacks = 0;
-          trace_capture_new_frames = 0;
-          trace_capture_gap_max_us = 0;
-        }
-
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
           if (!capture_ctx->images->running()) {
             capture_ctx = capture_ctxs.erase(capture_ctx);
@@ -2149,11 +2100,6 @@ namespace video {
       }
     }
 
-    auto trace_encode_window_start = std::chrono::steady_clock::now();
-    auto trace_encode_last_frame = trace_encode_window_start;
-    std::uint32_t trace_encode_frames = 0;
-    std::uint32_t trace_encode_fresh_frames = 0;
-    std::uint64_t trace_encode_gap_max_us = 0;
     while (true) {
       // Break out of the encoding loop if any of the following are true:
       // a) The stream is ending
@@ -2184,13 +2130,11 @@ namespace video {
       }
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
-      bool trace_fresh_frame = false;
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
           frame_timestamp = img->frame_timestamp;
-          trace_fresh_frame = true;
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             return;
@@ -2203,48 +2147,6 @@ namespace video {
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
-      }
-
-      auto trace_now = std::chrono::steady_clock::now();
-      auto trace_gap_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            trace_now - trace_encode_last_frame
-      ).count();
-      trace_encode_last_frame = trace_now;
-      trace_encode_frames++;
-      trace_encode_fresh_frames += trace_fresh_frame ? 1 : 0;
-      trace_encode_gap_max_us = std::max<std::uint64_t>(
-        trace_encode_gap_max_us,
-        std::max<std::int64_t>(trace_gap_us, 0)
-      );
-      auto trace_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                trace_now - trace_encode_window_start
-      ).count();
-      if (trace_gap_us > 20000) {
-        BOOST_LOG(info)
-          << "TPTRACE_VIDEO_ENCODE_GAP host_us="sv
-          << std::chrono::duration_cast<std::chrono::microseconds>(
-               trace_now.time_since_epoch()
-             ).count()
-          << " encode_gap_ms="sv << trace_gap_us / 1000.0
-          << " fresh_frame="sv << trace_fresh_frame;
-      }
-      if (trace_elapsed_us >= 500000) {
-        BOOST_LOG(info)
-          << "TPTRACE_VIDEO_ENCODE host_us="sv
-          << std::chrono::duration_cast<std::chrono::microseconds>(
-               trace_now.time_since_epoch()
-             ).count()
-          << " window_ms="sv << trace_elapsed_us / 1000.0
-          << " frames="sv << trace_encode_frames
-          << " encode_hz="sv << trace_encode_frames * 1000000.0 / trace_elapsed_us
-          << " fresh_frames="sv << trace_encode_fresh_frames
-          << " fresh_hz="sv
-          << trace_encode_fresh_frames * 1000000.0 / trace_elapsed_us
-          << " encode_gap_max_ms="sv << trace_encode_gap_max_us / 1000.0;
-        trace_encode_window_start = trace_now;
-        trace_encode_frames = 0;
-        trace_encode_fresh_frames = 0;
-        trace_encode_gap_max_us = 0;
       }
 
       session->request_normal_frame();
@@ -2449,54 +2351,8 @@ namespace video {
 
     auto ec = platf::capture_e::ok;
     bool capture_cursor = should_capture_cursor(synced_session_ctxs);
-    auto trace_sync_window_start = std::chrono::steady_clock::now();
-    auto trace_sync_last_callback = trace_sync_window_start;
-    std::uint32_t trace_sync_callbacks = 0;
-    std::uint32_t trace_sync_new_frames = 0;
-    std::uint64_t trace_sync_gap_max_us = 0;
     while (encode_session_ctx_queue.running()) {
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
-        auto trace_now = std::chrono::steady_clock::now();
-        auto trace_gap_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                              trace_now - trace_sync_last_callback
-        ).count();
-        trace_sync_last_callback = trace_now;
-        trace_sync_callbacks++;
-        trace_sync_new_frames += frame_captured ? 1 : 0;
-        trace_sync_gap_max_us = std::max<std::uint64_t>(
-          trace_sync_gap_max_us,
-          std::max<std::int64_t>(trace_gap_us, 0)
-        );
-        auto trace_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                  trace_now - trace_sync_window_start
-        ).count();
-        if (trace_gap_us > 20000) {
-          BOOST_LOG(info)
-            << "TPTRACE_VIDEO_SYNC_GAP host_us="sv
-            << std::chrono::duration_cast<std::chrono::microseconds>(
-                 trace_now.time_since_epoch()
-               ).count()
-            << " callback_gap_ms="sv << trace_gap_us / 1000.0
-            << " frame_captured="sv << frame_captured;
-        }
-        if (trace_elapsed_us >= 500000) {
-          BOOST_LOG(info)
-            << "TPTRACE_VIDEO_SYNC host_us="sv
-            << std::chrono::duration_cast<std::chrono::microseconds>(
-                 trace_now.time_since_epoch()
-               ).count()
-            << " window_ms="sv << trace_elapsed_us / 1000.0
-            << " callbacks="sv << trace_sync_callbacks
-            << " callback_hz="sv << trace_sync_callbacks * 1000000.0 / trace_elapsed_us
-            << " new_frames="sv << trace_sync_new_frames
-            << " new_frame_hz="sv << trace_sync_new_frames * 1000000.0 / trace_elapsed_us
-            << " callback_gap_max_ms="sv << trace_sync_gap_max_us / 1000.0;
-          trace_sync_window_start = trace_now;
-          trace_sync_callbacks = 0;
-          trace_sync_new_frames = 0;
-          trace_sync_gap_max_us = 0;
-        }
-
         while (encode_session_ctx_queue.peek()) {
           auto encode_session_ctx = encode_session_ctx_queue.pop();
           if (!encode_session_ctx) {
