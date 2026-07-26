@@ -1355,13 +1355,14 @@ namespace nvhttp {
         return;
       }
 
-      const auto clipboard_sequence = platf::clipboard_sequence();
       platf::clipboard_content_t content;
-      if (clipboard_sequence == 0 ||
-          !platf::get_clipboard_content(LI_CLIPBOARD_CAP_FILES, content) ||
+      if (!platf::get_clipboard_content(LI_CLIPBOARD_CAP_FILES, content) ||
           content.mime_type != LI_CLIPBOARD_MIME_FILE_MANIFEST ||
           content.paths.empty()) {
-        BOOST_LOG(info) << "Clipboard file pull found no files";
+        BOOST_LOG(info)
+          << "Clipboard file pull found no files (sequence "
+          << platf::clipboard_sequence()
+          << ')';
         write_clipboard_json(response, SimpleWeb::StatusCode::client_error_not_found, R"({"error":"clipboard_has_no_files"})");
         return;
       }
@@ -1369,7 +1370,7 @@ namespace nvhttp {
       auto result = clipboard_file_store::register_sources(
         content.paths,
         origin_id,
-        "pull:" + std::to_string(clipboard_sequence)
+        "pull:" + uuid_util::uuid_t::generate().string()
       );
       if (!result.ok ||
           result.manifest_size == 0 ||
