@@ -1,6 +1,7 @@
 #include "desktop_file_store.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -15,9 +16,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include "logging.h"
+
 #ifdef _WIN32
   #include <shlobj.h>
   #include <windows.h>
+  #include <wtsapi32.h>
 #endif
 
 extern "C" {
@@ -46,9 +50,11 @@ namespace desktop_file_store {
       std::vector<std::uint8_t> manifest;
       digest_t manifest_sha256 {};
       digest_t token_sha256 {};
+      std::vector<std::uint8_t> user_sid;
       std::string idempotency_key;
       std::vector<file_t> files;
       std::vector<std::size_t> top_level_indices;
+      fs::path desktop;
       fs::path staging_root;
       std::uint64_t total_file_bytes {};
       bool complete {};
@@ -61,6 +67,151 @@ namespace desktop_file_store {
 #ifdef SUNSHINE_TESTS
     std::optional<fs::path> test_desktop;
 #endif
+
+#ifdef _WIN32
+    std::vector<std::uint8_t> token_user_sid(HANDLE token) {
+      DWORD size = 0;
+      GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+      if (size == 0) {
+        return {};
+      }
+
+      std::vector<std::uint8_t> token_user(size);
+      if (!GetTokenInformation(
+            token,
+            TokenUser,
+            token_user.data(),
+            size,
+            &size
+          )) {
+        return {};
+      }
+
+      const auto *user =
+        reinterpret_cast<const TOKEN_USER *>(token_user.data());
+      const DWORD sid_size = GetLengthSid(user->User.Sid);
+      std::vector<std::uint8_t> sid(sid_size);
+      if (sid_size == 0 ||
+          !CopySid(sid_size, sid.data(), user->User.Sid)) {
+        return {};
+      }
+      return sid;
+    }
+
+    bool local_system_token(HANDLE token) {
+      auto sid = token_user_sid(token);
+      if (sid.empty()) {
+        return false;
+      }
+
+      std::array<std::uint8_t, SECURITY_MAX_SID_SIZE> system_sid {};
+      DWORD system_sid_size = static_cast<DWORD>(system_sid.size());
+      return CreateWellKnownSid(
+               WinLocalSystemSid,
+               nullptr,
+               system_sid.data(),
+               &system_sid_size
+             ) &&
+             EqualSid(sid.data(), system_sid.data());
+    }
+#endif
+
+    class interactive_user_context_t {
+    public:
+      interactive_user_context_t() {
+#ifdef _WIN32
+        HANDLE process_token {};
+        if (!OpenProcessToken(
+              GetCurrentProcess(),
+              TOKEN_QUERY,
+              &process_token
+            )) {
+          BOOST_LOG(error) << "Failed to open the Sunshine process token for desktop file transfer: "
+                           << GetLastError();
+          return;
+        }
+
+        if (!local_system_token(process_token)) {
+          token_ = process_token;
+        } else {
+          CloseHandle(process_token);
+          const DWORD session_id = WTSGetActiveConsoleSessionId();
+          if (session_id == 0xFFFFFFFF ||
+              !WTSQueryUserToken(session_id, &token_)) {
+            BOOST_LOG(error) << "Failed to query the interactive user for desktop file transfer: "
+                             << GetLastError();
+            token_ = nullptr;
+            return;
+          }
+          if (!ImpersonateLoggedOnUser(token_)) {
+            BOOST_LOG(error) << "Failed to impersonate the interactive user for desktop file transfer: "
+                             << GetLastError();
+            CloseHandle(token_);
+            token_ = nullptr;
+            return;
+          }
+          impersonating_ = true;
+        }
+
+        user_sid_ = token_user_sid(token_);
+        if (user_sid_.empty()) {
+          BOOST_LOG(error) << "Failed to read the interactive user identity for desktop file transfer";
+          reset();
+          return;
+        }
+#endif
+        valid_ = true;
+      }
+
+      interactive_user_context_t(const interactive_user_context_t &) = delete;
+      interactive_user_context_t &operator=(
+        const interactive_user_context_t &
+      ) = delete;
+
+      ~interactive_user_context_t() {
+        reset();
+      }
+
+      explicit operator bool() const {
+        return valid_;
+      }
+
+      const std::vector<std::uint8_t> &user_sid() const {
+        return user_sid_;
+      }
+
+#ifdef _WIN32
+      HANDLE known_folder_token() const {
+        return impersonating_ ? token_ : nullptr;
+      }
+#endif
+
+    private:
+      void reset() {
+#ifdef _WIN32
+        if (impersonating_) {
+          if (!RevertToSelf()) {
+            BOOST_LOG(fatal) << "Failed to revert desktop file transfer impersonation: "
+                             << GetLastError();
+            DebugBreak();
+          }
+          impersonating_ = false;
+        }
+        if (token_ != nullptr) {
+          CloseHandle(token_);
+          token_ = nullptr;
+        }
+#endif
+        valid_ = false;
+      }
+
+      bool valid_ {};
+      std::vector<std::uint8_t> user_sid_;
+#ifdef _WIN32
+      HANDLE token_ {};
+      bool impersonating_ {};
+#endif
+    };
 
     digest_t calculate_sha256(const void *data, std::size_t size) {
       digest_t digest {};
@@ -152,7 +303,9 @@ namespace desktop_file_store {
       ));
     }
 
-    fs::path desktop_directory() {
+    fs::path desktop_directory(
+      const interactive_user_context_t &user_context
+    ) {
 #ifdef SUNSHINE_TESTS
       if (test_desktop) {
         return *test_desktop;
@@ -163,7 +316,7 @@ namespace desktop_file_store {
       const HRESULT result = SHGetKnownFolderPath(
         FOLDERID_Desktop,
         KF_FLAG_CREATE,
-        nullptr,
+        user_context.known_folder_token(),
         &raw_path
       );
       if (FAILED(result) || raw_path == nullptr) {
@@ -178,6 +331,14 @@ namespace desktop_file_store {
 #else
       return {};
 #endif
+    }
+
+    std::string path_to_utf8(const fs::path &path) {
+      const auto utf8 = path.u8string();
+      return std::string(
+        reinterpret_cast<const char *>(utf8.data()),
+        utf8.size()
+      );
     }
 
     fs::path staging_base(const fs::path &desktop) {
@@ -244,8 +405,10 @@ namespace desktop_file_store {
       return digest_hex(token_sha256) + ':' + key;
     }
 
-    void remove_staging(const fs::path &path) {
-      const auto desktop = desktop_directory();
+    void remove_staging(
+      const fs::path &path,
+      const fs::path &desktop
+    ) {
       const auto base = desktop.empty() ? fs::path {} : staging_base(desktop);
       if (path.empty() || base.empty() || path.parent_path() != base ||
           !canonical_id(path.filename().string())) {
@@ -265,16 +428,21 @@ namespace desktop_file_store {
         position->second.idempotency_key
       ));
       const auto staging_root = position->second.staging_root;
+      const auto desktop = position->second.desktop;
       const bool complete = position->second.complete;
       entries.erase(position);
       if (!complete) {
-        remove_staging(staging_root);
+        remove_staging(staging_root, desktop);
       }
     }
 
-    void sweep_locked(clock_t::time_point now) {
+    void sweep_locked(
+      clock_t::time_point now,
+      const std::vector<std::uint8_t> &user_sid
+    ) {
       for (auto position = entries.begin(); position != entries.end();) {
-        if (position->second.expires_at > now) {
+        if (position->second.expires_at > now ||
+            position->second.user_sid != user_sid) {
           ++position;
           continue;
         }
@@ -354,6 +522,10 @@ namespace desktop_file_store {
     }
 
     try {
+      interactive_user_context_t user_context;
+      if (!user_context) {
+        return {.error = "desktop_unavailable"};
+      }
       const auto manifest_sha256 = calculate_sha256(
         manifest.data(),
         manifest.size()
@@ -362,7 +534,7 @@ namespace desktop_file_store {
       const auto now = clock_t::now();
 
       std::lock_guard lock(store_mutex);
-      sweep_locked(now);
+      sweep_locked(now, user_context.user_sid());
       const auto map_key = idempotency_map_key(
         token_sha256,
         idempotency_key
@@ -375,7 +547,8 @@ namespace desktop_file_store {
                 existing->second.manifest_sha256,
                 manifest_sha256
               ) ||
-              existing->second.manifest.size() != manifest.size()) {
+              existing->second.manifest.size() != manifest.size() ||
+              existing->second.user_sid != user_context.user_sid()) {
             return {.error = "idempotency_conflict"};
           }
           existing->second.expires_at = now +
@@ -394,7 +567,7 @@ namespace desktop_file_store {
         idempotency_entries.erase(mapped);
       }
 
-      const auto desktop = desktop_directory();
+      const auto desktop = desktop_directory(user_context);
       const auto base = desktop.empty() ? fs::path {} : staging_base(desktop);
       if (base.empty()) {
         return {.error = "desktop_unavailable"};
@@ -453,7 +626,7 @@ namespace desktop_file_store {
         );
         marker << "Sunshine desktop file transfer\n";
         if (!marker) {
-          remove_staging(staging_root);
+          remove_staging(staging_root, desktop);
           return {.error = "staging_marker_failed"};
         }
       }
@@ -474,7 +647,7 @@ namespace desktop_file_store {
           }
         }
         if (fs_error) {
-          remove_staging(staging_root);
+          remove_staging(staging_root, desktop);
           return {.error = fs_error.message()};
         }
       }
@@ -483,9 +656,11 @@ namespace desktop_file_store {
         .manifest = std::move(manifest),
         .manifest_sha256 = manifest_sha256,
         .token_sha256 = token_sha256,
+        .user_sid = user_context.user_sid(),
         .idempotency_key = std::move(idempotency_key),
         .files = std::move(files),
         .top_level_indices = std::move(top_level_indices),
+        .desktop = desktop,
         .staging_root = staging_root,
         .total_file_bytes = total_file_bytes,
         .complete = false,
@@ -515,6 +690,10 @@ namespace desktop_file_store {
     }
 
     try {
+      interactive_user_context_t user_context;
+      if (!user_context) {
+        return {.error = "interactive_user_unavailable"};
+      }
       const auto token_sha256 = calculate_sha256(token.data(), token.size());
       if (!digest_equal(
             calculate_sha256(bytes.data(), bytes.size()),
@@ -524,7 +703,7 @@ namespace desktop_file_store {
       }
 
       std::lock_guard lock(store_mutex);
-      sweep_locked(clock_t::now());
+      sweep_locked(clock_t::now(), user_context.user_sid());
       auto position = entries.find(id);
       if (position == entries.end()) {
         return {.error = "not_found"};
@@ -532,6 +711,7 @@ namespace desktop_file_store {
       auto &entry = position->second;
       if (entry.complete ||
           !digest_equal(entry.token_sha256, token_sha256) ||
+          entry.user_sid != user_context.user_sid() ||
           file_index >= entry.files.size()) {
         return {.error = "invalid_transfer"};
       }
@@ -591,15 +771,20 @@ namespace desktop_file_store {
       return {.error = "invalid_transfer"};
     }
     try {
+      interactive_user_context_t user_context;
+      if (!user_context) {
+        return {.error = "interactive_user_unavailable"};
+      }
       const auto token_sha256 = calculate_sha256(token.data(), token.size());
       std::lock_guard lock(store_mutex);
-      sweep_locked(clock_t::now());
+      sweep_locked(clock_t::now(), user_context.user_sid());
       auto position = entries.find(id);
       if (position == entries.end()) {
         return {.error = "not_found"};
       }
       auto &entry = position->second;
-      if (!digest_equal(entry.token_sha256, token_sha256)) {
+      if (!digest_equal(entry.token_sha256, token_sha256) ||
+          entry.user_sid != user_context.user_sid()) {
         return {.error = "invalid_transfer"};
       }
       if (entry.complete) {
@@ -635,7 +820,7 @@ namespace desktop_file_store {
         fs::last_write_time(file->staged_path, file_time, ignored);
       }
 
-      const auto desktop = desktop_directory();
+      const auto &desktop = entry.desktop;
       if (desktop.empty()) {
         return {.error = "desktop_unavailable"};
       }
@@ -670,6 +855,11 @@ namespace desktop_file_store {
       entry.complete = true;
       entry.expires_at = clock_t::now() +
                          std::chrono::seconds(completed_ttl_seconds);
+      for (const auto &[staged, destination] : moved) {
+        (void) staged;
+        BOOST_LOG(info) << "Desktop file upload committed to: "
+                        << path_to_utf8(destination);
+      }
       return {.ok = true};
     } catch (const std::exception &error) {
       return {.error = error.what()};
@@ -677,8 +867,12 @@ namespace desktop_file_store {
   }
 
   void sweep_expired() {
+    interactive_user_context_t user_context;
+    if (!user_context) {
+      return;
+    }
     std::lock_guard lock(store_mutex);
-    sweep_locked(clock_t::now());
+    sweep_locked(clock_t::now(), user_context.user_sid());
   }
 
 #ifdef SUNSHINE_TESTS
@@ -687,7 +881,7 @@ namespace desktop_file_store {
     for (const auto &[id, entry] : entries) {
       (void) id;
       if (!entry.complete) {
-        remove_staging(entry.staging_root);
+        remove_staging(entry.staging_root, entry.desktop);
       }
     }
     entries.clear();

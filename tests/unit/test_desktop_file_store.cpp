@@ -180,3 +180,39 @@ TEST_F(DesktopFileStoreTest, RejectsIncompleteAndOutOfOrderData) {
   EXPECT_EQ(completed.error, "upload_incomplete");
   EXPECT_FALSE(fs::exists(desktop / "folder"));
 }
+
+TEST_F(DesktopFileStoreTest, KeepsOriginalDesktopForEntireTransfer) {
+  auto transfer = desktop_file_store::begin(
+    make_manifest(),
+    token,
+    "original-desktop"
+  );
+  ASSERT_TRUE(transfer.ok) << transfer.error;
+
+  const auto other_desktop = fs::temp_directory_path() /
+                             ("sunshine-other-desktop-test-" +
+                              uuid_util::uuid_t::generate().string());
+  fs::create_directories(other_desktop);
+  auto other_desktop_guard = util::fail_guard([&]() {
+    desktop_file_store::set_desktop_for_tests(desktop);
+    std::error_code error;
+    fs::remove_all(other_desktop, error);
+  });
+  desktop_file_store::set_desktop_for_tests(other_desktop);
+
+  const std::vector<std::uint8_t> hello {'h', 'e', 'l', 'l', 'o'};
+  auto written = desktop_file_store::write_chunk(
+    transfer.id,
+    token,
+    1,
+    0,
+    hello,
+    sha256(hello)
+  );
+  ASSERT_TRUE(written.ok) << written.error;
+  auto completed = desktop_file_store::complete(transfer.id, token);
+  ASSERT_TRUE(completed.ok) << completed.error;
+
+  EXPECT_TRUE(fs::exists(desktop / "folder" / "hello.txt"));
+  EXPECT_FALSE(fs::exists(other_desktop / "folder"));
+}
