@@ -1348,6 +1348,60 @@ namespace nvhttp {
       write_clipboard_json(response, SimpleWeb::StatusCode::success_ok, std::format(R"({{"id":"{}","size":{},"sha256":"{}","expires_in":{}}})", result.id, result.manifest_size, digest_hex(result.manifest_sha256), clipboard_file_store::source_ttl_seconds));
     }
 
+    void pull_clipboard_file_source(resp_https_t response, req_https_t request) {
+      std::uint64_t origin_id {};
+      if (!validate_clipboard_origin(request, origin_id, true)) {
+        write_clipboard_json(response, SimpleWeb::StatusCode::client_error_forbidden, R"({"error":"inactive_clipboard_session"})");
+        return;
+      }
+
+      const auto clipboard_sequence = platf::clipboard_sequence();
+      platf::clipboard_content_t content;
+      if (clipboard_sequence == 0 ||
+          !platf::get_clipboard_content(LI_CLIPBOARD_CAP_FILES, content) ||
+          content.mime_type != LI_CLIPBOARD_MIME_FILE_MANIFEST ||
+          content.paths.empty()) {
+        BOOST_LOG(info) << "Clipboard file pull found no files";
+        write_clipboard_json(response, SimpleWeb::StatusCode::client_error_not_found, R"({"error":"clipboard_has_no_files"})");
+        return;
+      }
+
+      auto result = clipboard_file_store::register_sources(
+        content.paths,
+        origin_id,
+        "pull:" + std::to_string(clipboard_sequence)
+      );
+      if (!result.ok ||
+          result.manifest_size == 0 ||
+          result.manifest_size > UINT32_MAX) {
+        BOOST_LOG(warning)
+          << "Clipboard file pull registration failed: "
+          << (result.error.empty() ? "invalid manifest size" : result.error);
+        write_clipboard_json(
+          response,
+          SimpleWeb::StatusCode::client_error_conflict,
+          R"({"error":"file_registration_failed"})"
+        );
+        return;
+      }
+
+      BOOST_LOG(info)
+        << "Clipboard file pull prepared "
+        << content.paths.size()
+        << " top-level item(s)";
+      write_clipboard_json(
+        response,
+        SimpleWeb::StatusCode::success_ok,
+        std::format(
+          R"({{"id":"{}","size":{},"sha256":"{}","expires_in":{}}})",
+          result.id,
+          result.manifest_size,
+          digest_hex(result.manifest_sha256),
+          clipboard_file_store::source_ttl_seconds
+        )
+      );
+    }
+
     void poll_clipboard_file_request(resp_https_t response, req_https_t request) {
       std::uint64_t origin_id {};
       if (!validate_clipboard_origin(request, origin_id, true)) {
@@ -1792,6 +1846,7 @@ namespace nvhttp {
     https_server.resource["^/api/v2/clipboard/blobs$"]["POST"] = upload_clipboard_blob;
     https_server.resource["^/api/v2/clipboard/blobs/([0-9a-f\\-]{36})$"]["GET"] = download_clipboard_blob;
     https_server.resource["^/api/v2/clipboard/files$"]["POST"] = register_clipboard_file_source;
+    https_server.resource["^/api/v2/clipboard/files/pull$"]["POST"] = pull_clipboard_file_source;
     https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/requests$"]["GET"] = poll_clipboard_file_request;
     https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/requests/([0-9a-f\\-]{36})$"]["POST"] = fulfill_clipboard_file_request;
     https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/manifest$"]["GET"] = download_clipboard_file_manifest;
