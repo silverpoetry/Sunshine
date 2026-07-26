@@ -1,6 +1,8 @@
 #include "clipboard_virtual_files.h"
 
 #include "../../clipboard_file_store.h"
+#include "src/logging.h"
+#include "src/utility.h"
 #include "utf_utils.h"
 
 #include <algorithm>
@@ -16,7 +18,9 @@
 #include <shldisp.h>
 #include <shlobj.h>
 #include <thread>
+#include <variant>
 #include <windows.h>
+#include <wtsapi32.h>
 
 extern "C" {
 #include <moonlight-common-c/src/Clipboard.h>
@@ -44,6 +48,64 @@ namespace platf::windows {
       std::uint64_t size {};
       std::uint64_t modified_time_ms {};
     };
+
+    HRESULT read_file_clipboard_paths(std::vector<std::filesystem::path> &paths) {
+      IDataObject *object = nullptr;
+      const auto clipboard_result = OleGetClipboard(&object);
+      if (FAILED(clipboard_result)) {
+        return clipboard_result;
+      }
+      if (!object) {
+        return E_UNEXPECTED;
+      }
+      auto release_object = util::fail_guard([object]() {
+        object->Release();
+      });
+
+      FORMATETC format {
+        CF_HDROP,
+        nullptr,
+        DVASPECT_CONTENT,
+        -1,
+        TYMED_HGLOBAL,
+      };
+      STGMEDIUM medium {};
+      const auto data_result = object->GetData(&format, &medium);
+      if (FAILED(data_result)) {
+        return data_result;
+      }
+      auto release_medium = util::fail_guard([&medium]() {
+        ReleaseStgMedium(&medium);
+      });
+
+      if (medium.tymed != TYMED_HGLOBAL || !medium.hGlobal) {
+        return DV_E_TYMED;
+      }
+
+      const auto drop = static_cast<HDROP>(medium.hGlobal);
+      const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+      if (count == 0 || count > LI_CLIPBOARD_MAX_FILE_ENTRIES) {
+        return DV_E_FORMATETC;
+      }
+
+      std::vector<std::filesystem::path> result;
+      result.reserve(count);
+      for (UINT index = 0; index < count; ++index) {
+        const UINT length = DragQueryFileW(drop, index, nullptr, 0);
+        if (length == 0) {
+          return DV_E_FORMATETC;
+        }
+        std::wstring path(length + 1, L'\0');
+        if (DragQueryFileW(drop, index, path.data(), length + 1) != length) {
+          return DV_E_FORMATETC;
+        }
+        path.resize(length);
+        result.emplace_back(std::move(path));
+      }
+
+      paths = std::move(result);
+      return S_OK;
+    }
 
     HGLOBAL copy_to_global_memory(const void *source, std::size_t size) {
       HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size);
@@ -725,12 +787,12 @@ namespace platf::windows {
           }
           return false;
         }
-        auto job = std::make_shared<job_t>();
+        auto job = std::make_shared<set_job_t>();
         job->object = object;
         auto result = job->result.get_future();
         {
           std::lock_guard lock(mutex_);
-          jobs_.push_back(job);
+          jobs_.emplace_back(job);
           if (!SetEvent(wake_event_)) {
             jobs_.pop_back();
             object->Release();
@@ -740,11 +802,47 @@ namespace platf::windows {
         return SUCCEEDED(result.get());
       }
 
+      bool get_file_paths(std::vector<std::filesystem::path> &paths) {
+        if (!ole_available_) {
+          return false;
+        }
+        auto job = std::make_shared<get_file_paths_job_t>();
+        auto result = job->result.get_future();
+        {
+          std::lock_guard lock(mutex_);
+          jobs_.emplace_back(job);
+          if (!SetEvent(wake_event_)) {
+            jobs_.pop_back();
+            return false;
+          }
+        }
+
+        auto value = result.get();
+        if (FAILED(value.status) || value.paths.empty()) {
+          return false;
+        }
+        paths = std::move(value.paths);
+        return true;
+      }
+
     private:
-      struct job_t {
+      struct set_job_t {
         IDataObject *object {};
         std::promise<HRESULT> result;
       };
+
+      struct get_file_paths_result_t {
+        HRESULT status {};
+        std::vector<std::filesystem::path> paths;
+      };
+
+      struct get_file_paths_job_t {
+        std::promise<get_file_paths_result_t> result;
+      };
+
+      using job_t = std::variant<
+        std::shared_ptr<set_job_t>,
+        std::shared_ptr<get_file_paths_job_t>>;
 
       void run() {
         if (!wake_event_) {
@@ -753,6 +851,38 @@ namespace platf::windows {
           ready_.notify_all();
           return;
         }
+
+        // Sunshine's service places its LocalSystem token in the interactive
+        // session. OLE clipboard owners may still reject data requests from
+        // that identity, so keep this apartment impersonating the console user.
+        HANDLE user_token = nullptr;
+        bool impersonating_user = false;
+        const DWORD console_session_id = WTSGetActiveConsoleSessionId();
+        if (console_session_id != 0xFFFFFFFF &&
+            WTSQueryUserToken(console_session_id, &user_token)) {
+          if (!ImpersonateLoggedOnUser(user_token)) {
+            BOOST_LOG(error)
+              << "Failed to impersonate the interactive user for OLE clipboard access: "
+              << GetLastError();
+            CloseHandle(user_token);
+            user_token = nullptr;
+          } else {
+            impersonating_user = true;
+          }
+        }
+
+        const auto restore_identity = [&]() {
+          if (impersonating_user && !RevertToSelf()) {
+            BOOST_LOG(fatal)
+              << "Failed to revert OLE clipboard thread impersonation: "
+              << GetLastError();
+            DebugBreak();
+          }
+          if (user_token) {
+            CloseHandle(user_token);
+          }
+        };
+
         const auto initialize_result = OleInitialize(nullptr);
         {
           std::lock_guard lock(mutex_);
@@ -761,6 +891,7 @@ namespace platf::windows {
         }
         ready_.notify_all();
         if (!ole_available_) {
+          restore_identity();
           return;
         }
 
@@ -773,7 +904,7 @@ namespace platf::windows {
             QS_ALLINPUT
           );
           if (wait_result == WAIT_OBJECT_0) {
-            std::deque<std::shared_ptr<job_t>> jobs;
+            std::deque<job_t> jobs;
             bool stopping;
             {
               std::lock_guard lock(mutex_);
@@ -782,9 +913,21 @@ namespace platf::windows {
               ResetEvent(wake_event_);
             }
             for (const auto &job : jobs) {
-              const auto result = OleSetClipboard(job->object);
-              job->object->Release();
-              job->result.set_value(result);
+              std::visit(
+                util::overloaded {
+                  [](const std::shared_ptr<set_job_t> &set_job) {
+                    const auto result = OleSetClipboard(set_job->object);
+                    set_job->object->Release();
+                    set_job->result.set_value(result);
+                  },
+                  [](const std::shared_ptr<get_file_paths_job_t> &get_job) {
+                    get_file_paths_result_t result;
+                    result.status = read_file_clipboard_paths(result.paths);
+                    get_job->result.set_value(std::move(result));
+                  },
+                },
+                job
+              );
             }
             if (stopping) {
               break;
@@ -800,13 +943,14 @@ namespace platf::windows {
           }
         }
         OleUninitialize();
+        restore_identity();
       }
 
       HANDLE wake_event_;
       std::thread thread_;
       std::mutex mutex_;
       std::condition_variable ready_;
-      std::deque<std::shared_ptr<job_t>> jobs_;
+      std::deque<job_t> jobs_;
       bool initialized_ {};
       bool ole_available_ {};
       bool stopping_ {};
@@ -817,6 +961,11 @@ namespace platf::windows {
       return broker;
     }
   }  // namespace
+
+  bool get_file_clipboard_paths(std::vector<std::filesystem::path> &paths) {
+    paths.clear();
+    return clipboard_broker().get_file_paths(paths);
+  }
 
   bool set_virtual_file_clipboard(const std::vector<std::uint8_t> &manifest, const std::string &transfer_id, std::uint64_t origin_id, std::uint64_t item_id) {
     std::vector<file_entry_t> files;

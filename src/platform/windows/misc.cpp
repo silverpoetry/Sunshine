@@ -2323,6 +2323,12 @@ namespace platf {
   bool get_clipboard_content(std::uint8_t allowed_capabilities, clipboard_content_t &content) {
     content = {};
 
+    if ((allowed_capabilities & LI_CLIPBOARD_CAP_FILES) != 0 &&
+        windows::get_file_clipboard_paths(content.paths)) {
+      content.mime_type = LI_CLIPBOARD_MIME_FILE_MANIFEST;
+      return true;
+    }
+
     if (!open_clipboard_with_retry()) {
       BOOST_LOG(debug) << "Failed to open clipboard for reading";
       return false;
