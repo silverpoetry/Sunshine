@@ -566,6 +566,7 @@ namespace platf::dxgi {
       AcquireSRWLockExclusive(&frame_lock);
       if (produced_frame) {
         produced_frame.Close();
+        trace_producer_drops++;
       }
 
       produced_frame = frame;
@@ -590,6 +591,7 @@ namespace platf::dxgi {
     // this CONSUMER runs in the capture thread
     release_frame();
 
+    std::uint64_t producer_drops = 0;
     AcquireSRWLockExclusive(&frame_lock);
     if (produced_frame == nullptr && SleepConditionVariableSRW(&frame_present_cv, &frame_lock, timeout.count(), 0) == 0) {
       ReleaseSRWLockExclusive(&frame_lock);
@@ -602,6 +604,8 @@ namespace platf::dxgi {
     if (produced_frame) {
       consumed_frame = produced_frame;
       produced_frame = nullptr;
+      producer_drops = trace_producer_drops;
+      trace_producer_drops = 0;
     }
     ReleaseSRWLockExclusive(&frame_lock);
     if (consumed_frame == nullptr) {  // spurious wakeup
@@ -614,7 +618,132 @@ namespace platf::dxgi {
     }
     capture_access->GetInterface(IID_ID3D11Texture2D, (void **) out);
     out_time = consumed_frame.SystemRelativeTime().count();  // raw ticks from query performance counter
+    trace_frame(out_time, 0, 0, 0, 0, producer_drops);
     return capture_e::ok;
+  }
+
+  void wgc_capture_t::trace_frame(
+    std::uint64_t frame_qpc,
+    std::uint64_t helper_sequence,
+    std::uint64_t helper_send_qpc,
+    std::uint64_t received_qpc,
+    std::uint64_t acquired_qpc,
+    std::uint64_t producer_drops
+  ) {
+    auto now_qpc = static_cast<std::uint64_t>(qpc_counter());
+    auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+    auto source_gap_us = trace_last_frame_qpc == 0 ?
+                           0 :
+                           std::chrono::duration_cast<std::chrono::microseconds>(
+                             qpc_time_difference(frame_qpc, trace_last_frame_qpc)
+                           ).count();
+    auto consume_gap_us = trace_last_consume_us == 0 ?
+                            0 :
+                            now_us - trace_last_consume_us;
+    auto age_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    qpc_time_difference(now_qpc, frame_qpc)
+    ).count();
+    auto ipc_us = helper_send_qpc == 0 ?
+                    0 :
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                      qpc_time_difference(received_qpc, helper_send_qpc)
+                    ).count();
+    auto mutex_us = received_qpc == 0 ?
+                      0 :
+                      std::chrono::duration_cast<std::chrono::microseconds>(
+                        qpc_time_difference(acquired_qpc, received_qpc)
+                      ).count();
+
+    if (trace_window_start_us == 0) {
+      trace_window_start_us = now_us;
+    }
+    if (source_gap_us > 0) {
+      trace_source_gap_total_us += source_gap_us;
+      trace_source_gap_max_us = std::max<std::uint64_t>(
+        trace_source_gap_max_us,
+        source_gap_us
+      );
+      trace_source_intervals++;
+    }
+    trace_consume_gap_max_us = std::max(trace_consume_gap_max_us, consume_gap_us);
+    trace_age_total_us += std::max<std::int64_t>(age_us, 0);
+    trace_age_max_us = std::max<std::uint64_t>(
+      trace_age_max_us,
+      std::max<std::int64_t>(age_us, 0)
+    );
+    trace_ipc_max_us = std::max<std::uint64_t>(
+      trace_ipc_max_us,
+      std::max<std::int64_t>(ipc_us, 0)
+    );
+    trace_mutex_max_us = std::max<std::uint64_t>(
+      trace_mutex_max_us,
+      std::max<std::int64_t>(mutex_us, 0)
+    );
+    if (helper_sequence != 0 && trace_helper_last_sequence != 0 &&
+        helper_sequence > trace_helper_last_sequence + 1) {
+      trace_helper_skips += static_cast<std::uint32_t>(
+        helper_sequence - trace_helper_last_sequence - 1
+      );
+    }
+    if (helper_sequence != 0) {
+      trace_helper_last_sequence = helper_sequence;
+    }
+
+    trace_window_producer_drops += static_cast<std::uint32_t>(producer_drops);
+    trace_frames++;
+    trace_last_frame_qpc = frame_qpc;
+    trace_last_consume_us = now_us;
+
+    if (source_gap_us > 20000 || consume_gap_us > 20000 ||
+        age_us > 20000 || ipc_us > 20000 || mutex_us > 20000 ||
+        producer_drops != 0) {
+      BOOST_LOG(info)
+        << "TPTRACE_WGC_GAP host_us="sv << now_us
+        << " source_gap_ms="sv << source_gap_us / 1000.0
+        << " consume_gap_ms="sv << consume_gap_us / 1000.0
+        << " age_ms="sv << age_us / 1000.0
+        << " producer_drops="sv << producer_drops
+        << " helper_seq="sv << helper_sequence
+        << " ipc_ms="sv << ipc_us / 1000.0
+        << " mutex_ms="sv << mutex_us / 1000.0;
+    }
+
+    auto elapsed_us = std::max<std::uint64_t>(now_us - trace_window_start_us, 1);
+    if (elapsed_us >= 500000) {
+      BOOST_LOG(info)
+        << "TPTRACE_WGC host_us="sv << now_us
+        << " window_ms="sv << elapsed_us / 1000.0
+        << " frames="sv << trace_frames
+        << " rate_hz="sv << trace_frames * 1000000.0 / elapsed_us
+        << " source_gap_avg_ms="sv
+        << (trace_source_intervals == 0 ? 0.0 :
+              trace_source_gap_total_us /
+                (1000.0 * trace_source_intervals))
+        << " source_gap_max_ms="sv << trace_source_gap_max_us / 1000.0
+        << " consume_gap_max_ms="sv << trace_consume_gap_max_us / 1000.0
+        << " age_avg_ms="sv
+        << trace_age_total_us / (1000.0 * std::max<std::uint32_t>(trace_frames, 1))
+        << " age_max_ms="sv << trace_age_max_us / 1000.0
+        << " producer_drops="sv << trace_window_producer_drops
+        << " helper_skips="sv << trace_helper_skips
+        << " ipc_max_ms="sv << trace_ipc_max_us / 1000.0
+        << " mutex_max_ms="sv << trace_mutex_max_us / 1000.0;
+
+      trace_window_start_us = now_us;
+      trace_source_gap_total_us = 0;
+      trace_source_gap_max_us = 0;
+      trace_consume_gap_max_us = 0;
+      trace_age_total_us = 0;
+      trace_age_max_us = 0;
+      trace_ipc_max_us = 0;
+      trace_mutex_max_us = 0;
+      trace_frames = 0;
+      trace_source_intervals = 0;
+      trace_window_producer_drops = 0;
+      trace_helper_skips = 0;
+    }
   }
 
   capture_e wgc_capture_t::release_frame() {
@@ -832,6 +961,14 @@ namespace platf::dxgi {
       *out = helper_texture.get();
       (*out)->AddRef();
       out_time = message.qpc_timestamp;
+      trace_frame(
+        out_time,
+        message.sequence,
+        message.helper_send_qpc,
+        received_qpc,
+        acquired_qpc,
+        0
+      );
       return capture_e::ok;
     }
   }

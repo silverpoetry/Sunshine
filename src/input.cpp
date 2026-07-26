@@ -152,6 +152,36 @@ namespace input {
     button_state_e back_button_state;
   };
 
+  struct queued_input_t {
+    std::vector<std::uint8_t> data;
+    std::uint64_t receivedUs;
+  };
+
+  struct touchpad_trace_t {
+    std::uint64_t windowStartUs {};
+    std::uint64_t lastReceiveUs {};
+    std::uint64_t lastProcessUs {};
+    std::uint32_t lastSourceTimeMs {};
+    std::uint64_t sourceGapTotalMs {};
+    std::uint64_t receiveGapTotalUs {};
+    std::uint64_t processQueueDelayTotalUs {};
+    std::uint64_t sourceGapMaxMs {};
+    std::uint64_t receiveGapMaxUs {};
+    std::uint64_t processGapMaxUs {};
+    std::uint64_t processQueueDelayMaxUs {};
+    std::uint64_t transportJitterMaxUs {};
+    std::uint32_t receiveFrames {};
+    std::uint32_t processFrames {};
+    std::uint32_t batchedFrames {};
+    std::uint32_t lostFrames {};
+    std::uint32_t sourceIntervals {};
+    std::uint32_t receiveIntervals {};
+    std::uint32_t maxQueueDepth {};
+    std::uint8_t firstSequence {};
+    std::uint8_t lastSequence {};
+    bool haveSequence {};
+  };
+
   struct input_t {
     enum shortkey_e {
       CTRL = 0x1,  ///< Control key
@@ -184,8 +214,9 @@ namespace input {
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;
     platf::feedback_queue_t feedback_queue;
 
-    std::list<std::vector<uint8_t>> input_queue;
+    std::list<queued_input_t> input_queue;
     std::mutex input_queue_lock;
+    touchpad_trace_t touchpad_trace;
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;
 
@@ -194,6 +225,159 @@ namespace input {
     int32_t accumulated_vscroll_delta;
     int32_t accumulated_hscroll_delta;
   };
+
+  std::uint64_t steady_time_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+  }
+
+  struct touchpad_trace_header_t {
+    std::uint8_t sequence;
+    std::uint32_t sourceTimeMs;
+    bool valid;
+  };
+
+  touchpad_trace_header_t get_touchpad_trace_header(const std::vector<std::uint8_t> &data) {
+    if (data.size() < sizeof(SS_TOUCHPAD_FRAME_PACKET)) {
+      return {};
+    }
+
+    auto packet = reinterpret_cast<const SS_TOUCHPAD_FRAME_PACKET *>(data.data());
+    if (util::endian::little(packet->header.magic) != SS_TOUCHPAD_FRAME_MAGIC) {
+      return {};
+    }
+
+    auto source_time_ms =
+      static_cast<std::uint32_t>(packet->contacts[1].zero[0]) |
+      (static_cast<std::uint32_t>(packet->contacts[2].zero[0]) << 8) |
+      (static_cast<std::uint32_t>(packet->contacts[3].zero[0]) << 16) |
+      (static_cast<std::uint32_t>(packet->contacts[4].zero[0]) << 24);
+    return {
+      packet->contacts[0].zero[0],
+      source_time_ms,
+      source_time_ms != 0,
+    };
+  }
+
+  void log_touchpad_trace_locked(input_t &input, std::uint64_t now_us, bool force) {
+    auto &trace = input.touchpad_trace;
+    if (trace.windowStartUs == 0 || trace.receiveFrames == 0) {
+      return;
+    }
+
+    auto elapsed_us = std::max<std::uint64_t>(now_us - trace.windowStartUs, 1);
+    if (!force && elapsed_us < 500000) {
+      return;
+    }
+
+    BOOST_LOG(info)
+      << "TPTRACE_HOST_INPUT host_us="sv << now_us
+      << " window_ms="sv << elapsed_us / 1000.0
+      << " rx="sv << trace.receiveFrames
+      << " rx_hz="sv << trace.receiveFrames * 1000000.0 / elapsed_us
+      << " processed="sv << trace.processFrames
+      << " batched="sv << trace.batchedFrames
+      << " lost="sv << trace.lostFrames
+      << " seq="sv << static_cast<unsigned>(trace.firstSequence)
+      << '-' << static_cast<unsigned>(trace.lastSequence)
+      << " source_gap_avg_ms="sv
+      << (trace.sourceIntervals == 0 ? 0.0 :
+            trace.sourceGapTotalMs / static_cast<double>(trace.sourceIntervals))
+      << " source_gap_max_ms="sv << trace.sourceGapMaxMs
+      << " rx_gap_avg_ms="sv
+      << (trace.receiveIntervals == 0 ? 0.0 :
+            trace.receiveGapTotalUs / (1000.0 * trace.receiveIntervals))
+      << " rx_gap_max_ms="sv << trace.receiveGapMaxUs / 1000.0
+      << " transport_jitter_max_ms="sv << trace.transportJitterMaxUs / 1000.0
+      << " process_gap_max_ms="sv << trace.processGapMaxUs / 1000.0
+      << " queue_delay_avg_ms="sv
+      << (trace.processFrames == 0 ? 0.0 :
+            trace.processQueueDelayTotalUs / (1000.0 * trace.processFrames))
+      << " queue_delay_max_ms="sv << trace.processQueueDelayMaxUs / 1000.0
+      << " queue_max="sv << trace.maxQueueDepth;
+
+    trace.windowStartUs = now_us;
+    trace.sourceGapTotalMs = 0;
+    trace.receiveGapTotalUs = 0;
+    trace.processQueueDelayTotalUs = 0;
+    trace.sourceGapMaxMs = 0;
+    trace.receiveGapMaxUs = 0;
+    trace.processGapMaxUs = 0;
+    trace.processQueueDelayMaxUs = 0;
+    trace.transportJitterMaxUs = 0;
+    trace.receiveFrames = 0;
+    trace.processFrames = 0;
+    trace.batchedFrames = 0;
+    trace.lostFrames = 0;
+    trace.sourceIntervals = 0;
+    trace.receiveIntervals = 0;
+    trace.maxQueueDepth = 0;
+  }
+
+  void trace_touchpad_receive_locked(input_t &input, const queued_input_t &entry) {
+    auto header = get_touchpad_trace_header(entry.data);
+    if (!header.valid) {
+      return;
+    }
+
+    auto &trace = input.touchpad_trace;
+    if (trace.windowStartUs == 0) {
+      trace.windowStartUs = entry.receivedUs;
+    }
+    if (trace.receiveFrames == 0) {
+      trace.firstSequence = header.sequence;
+    }
+
+    std::uint64_t receive_gap_us = 0;
+    std::uint32_t source_gap_ms = 0;
+    std::uint8_t sequence_delta = 1;
+    if (trace.haveSequence) {
+      sequence_delta = static_cast<std::uint8_t>(header.sequence - trace.lastSequence);
+      if (sequence_delta > 1) {
+        trace.lostFrames += sequence_delta - 1;
+      }
+
+      source_gap_ms = header.sourceTimeMs - trace.lastSourceTimeMs;
+      receive_gap_us = entry.receivedUs - trace.lastReceiveUs;
+      trace.sourceGapTotalMs += source_gap_ms;
+      trace.receiveGapTotalUs += receive_gap_us;
+      trace.sourceGapMaxMs = std::max<std::uint64_t>(trace.sourceGapMaxMs, source_gap_ms);
+      trace.receiveGapMaxUs = std::max(trace.receiveGapMaxUs, receive_gap_us);
+      trace.sourceIntervals++;
+      trace.receiveIntervals++;
+
+      auto source_gap_us = static_cast<std::int64_t>(source_gap_ms) * 1000;
+      auto jitter_us = static_cast<std::int64_t>(receive_gap_us) - source_gap_us;
+      auto absolute_jitter_us = static_cast<std::uint64_t>(std::abs(jitter_us));
+      trace.transportJitterMaxUs = std::max(trace.transportJitterMaxUs, absolute_jitter_us);
+
+      if (source_gap_ms > 20 || receive_gap_us > 20000 ||
+          absolute_jitter_us > 20000 || sequence_delta > 1) {
+        BOOST_LOG(info)
+          << "TPTRACE_HOST_RX_GAP host_us="sv << entry.receivedUs
+          << " seq="sv << static_cast<unsigned>(header.sequence)
+          << " seq_delta="sv << static_cast<unsigned>(sequence_delta)
+          << " source_gap_ms="sv << source_gap_ms
+          << " rx_gap_ms="sv << receive_gap_us / 1000.0
+          << " jitter_ms="sv << jitter_us / 1000.0
+          << " queue="sv << input.input_queue.size();
+      }
+    }
+
+    trace.haveSequence = true;
+    trace.lastSequence = header.sequence;
+    trace.lastSourceTimeMs = header.sourceTimeMs;
+    trace.lastReceiveUs = entry.receivedUs;
+    trace.receiveFrames++;
+    trace.lastSequence = header.sequence;
+    trace.maxQueueDepth = std::max<std::uint32_t>(
+      trace.maxQueueDepth,
+      static_cast<std::uint32_t>(input.input_queue.size())
+    );
+
+    log_touchpad_trace_locked(input, entry.receivedUs, false);
+  }
 
   /**
    * @brief Apply shortcut based on VKEY
@@ -1108,6 +1292,12 @@ namespace input {
     touchpad.rotation = rotation;
     touchpad.deviceWidthMm = util::endian::little(packet->deviceWidthMm);
     touchpad.deviceHeightMm = util::endian::little(packet->deviceHeightMm);
+    touchpad.traceSequence = packet->contacts[0].zero[0];
+    touchpad.traceClientTimeMs =
+      static_cast<std::uint32_t>(packet->contacts[1].zero[0]) |
+      (static_cast<std::uint32_t>(packet->contacts[2].zero[0]) << 8) |
+      (static_cast<std::uint32_t>(packet->contacts[3].zero[0]) << 16) |
+      (static_cast<std::uint32_t>(packet->contacts[4].zero[0]) << 24);
 
     for (std::uint8_t i = 0; i < contact_count; i++) {
       touchpad.contacts[i] = {
@@ -1760,8 +1950,10 @@ namespace input {
    */
   void passthrough_next_message(std::shared_ptr<input_t> input) {
     // 'entry' backs the 'payload' pointer, so they must remain in scope together
-    std::vector<uint8_t> entry;
+    queued_input_t entry;
     PNV_INPUT_HEADER payload;
+    bool traced_touchpad_frame = false;
+    bool trace_state_change = false;
 
     // Lock the input queue while batching, but release it before sending
     // the input to the OS. This avoids potentially lengthy lock contention
@@ -1776,14 +1968,14 @@ namespace input {
 
       // Pop off the first entry, which we will send
       entry = input->input_queue.front();
-      payload = (PNV_INPUT_HEADER) entry.data();
+      payload = (PNV_INPUT_HEADER) entry.data.data();
       input->input_queue.pop_front();
 
       // Try to batch with remaining items on the queue
       auto i = input->input_queue.begin();
       while (i != input->input_queue.end()) {
-        auto batchable_entry = *i;
-        auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data();
+        auto &batchable_entry = *i;
+        auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data.data();
 
         auto batch_result = batch(payload, batchable_payload);
         if (batch_result == batch_result_e::terminate_batch) {
@@ -1791,10 +1983,44 @@ namespace input {
           break;
         } else if (batch_result == batch_result_e::batched) {
           // Erase this entry since it was batched
+          if (util::endian::little(payload->magic) == SS_TOUCHPAD_FRAME_MAGIC &&
+              get_touchpad_trace_header(entry.data).valid) {
+            input->touchpad_trace.batchedFrames++;
+            entry.receivedUs = batchable_entry.receivedUs;
+          }
           i = input->input_queue.erase(i);
         } else {
           // We couldn't batch this entry, but try to batch later entries.
           i++;
+        }
+      }
+
+      if (util::endian::little(payload->magic) == SS_TOUCHPAD_FRAME_MAGIC &&
+          get_touchpad_trace_header(entry.data).valid) {
+        auto now_us = steady_time_us();
+        auto &trace = input->touchpad_trace;
+        auto process_gap_us =
+          trace.lastProcessUs == 0 ? 0 : now_us - trace.lastProcessUs;
+        auto queue_delay_us = now_us - entry.receivedUs;
+        trace.processFrames++;
+        trace.processQueueDelayTotalUs += queue_delay_us;
+        trace.processQueueDelayMaxUs =
+          std::max(trace.processQueueDelayMaxUs, queue_delay_us);
+        trace.processGapMaxUs = std::max(trace.processGapMaxUs, process_gap_us);
+        trace.lastProcessUs = now_us;
+        traced_touchpad_frame = true;
+        trace_state_change =
+          !touchpad_frame_is_move_only((PSS_TOUCHPAD_FRAME_PACKET) payload);
+
+        if (process_gap_us > 20000 || queue_delay_us > 20000) {
+          auto header = get_touchpad_trace_header(entry.data);
+          BOOST_LOG(info)
+            << "TPTRACE_HOST_PROCESS_GAP host_us="sv << now_us
+            << " seq="sv << static_cast<unsigned>(header.sequence)
+            << " process_gap_ms="sv << process_gap_us / 1000.0
+            << " queue_delay_ms="sv << queue_delay_us / 1000.0
+            << " batched_total="sv << trace.batchedFrames
+            << " queue="sv << input->input_queue.size();
         }
       }
     }
@@ -1855,6 +2081,11 @@ namespace input {
         passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
         break;
     }
+
+    if (traced_touchpad_frame && trace_state_change) {
+      std::lock_guard<std::mutex> lg(input->input_queue_lock);
+      log_touchpad_trace_locked(*input, steady_time_us(), true);
+    }
   }
 
   /**
@@ -1865,7 +2096,12 @@ namespace input {
   void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data) {
     {
       std::lock_guard<std::mutex> lg(input->input_queue_lock);
-      input->input_queue.push_back(std::move(input_data));
+      queued_input_t entry {
+        std::move(input_data),
+        steady_time_us(),
+      };
+      input->input_queue.push_back(std::move(entry));
+      trace_touchpad_receive_locked(*input, input->input_queue.back());
     }
     task_pool.push(passthrough_next_message, input);
   }
