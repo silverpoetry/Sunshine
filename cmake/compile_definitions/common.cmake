@@ -93,6 +93,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/clipboard_blob_store.h"
         "${CMAKE_SOURCE_DIR}/src/clipboard_file_store.cpp"
         "${CMAKE_SOURCE_DIR}/src/clipboard_file_store.h"
+        "${CMAKE_SOURCE_DIR}/src/desktop_file_store.cpp"
+        "${CMAKE_SOURCE_DIR}/src/desktop_file_store.h"
         "${CMAKE_SOURCE_DIR}/src/nvhttp.cpp"
         "${CMAKE_SOURCE_DIR}/src/nvhttp.h"
         "${CMAKE_SOURCE_DIR}/src/httpcommon.cpp"

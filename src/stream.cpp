@@ -182,17 +182,6 @@ namespace stream {
     audio  ///< Audio
   };
 
-  namespace clipboard {
-    constexpr std::uint8_t V1_OP_HELLO = 0x01;
-    constexpr std::uint8_t V1_OP_SET = 0x02;
-    constexpr std::uint8_t V1_OP_REQUEST = 0x03;
-    constexpr std::uint8_t V1_OP_ACK = 0x04;
-    constexpr std::uint8_t V1_OP_NACK = 0x05;
-    constexpr std::uint8_t V1_FLAG_CAN_SEND = 0x01;
-    constexpr std::uint8_t V1_FLAG_CAN_RECEIVE = 0x02;
-    constexpr std::uint32_t V1_MAX_CHUNK_BYTES = 60 * 1024;
-  }  // namespace clipboard
-
 #pragma pack(push, 1)
 
   struct video_short_frame_header_t {
@@ -335,42 +324,6 @@ namespace stream {
     boost::endian::little_uint16_at hotspotY;
     boost::endian::little_uint32_at shapeId;
     boost::endian::little_uint32_at imageSize;
-  };
-
-  struct control_clipboard_t {
-    control_header_v2 header;
-
-    std::uint8_t version;
-    std::uint8_t op;
-    std::uint8_t mimeType;
-    std::uint8_t flags;
-    boost::endian::little_uint32_at sequence;
-    boost::endian::little_uint32_at totalLength;
-    boost::endian::little_uint32_at chunkOffset;
-    boost::endian::little_uint32_at chunkLength;
-
-    std::uint8_t *data() {
-      return (std::uint8_t *) (this + 1);
-    }
-
-    const std::uint8_t *data() const {
-      return (const std::uint8_t *) (this + 1);
-    }
-  };
-
-  struct control_clipboard_payload_t {
-    std::uint8_t version;
-    std::uint8_t op;
-    std::uint8_t mimeType;
-    std::uint8_t flags;
-    boost::endian::little_uint32_at sequence;
-    boost::endian::little_uint32_at totalLength;
-    boost::endian::little_uint32_at chunkOffset;
-    boost::endian::little_uint32_at chunkLength;
-
-    const std::uint8_t *data() const {
-      return (const std::uint8_t *) (this + 1);
-    }
   };
 
   typedef struct control_encrypted_t {
@@ -587,7 +540,6 @@ namespace stream {
       bool clipboard_negotiated {};
       bool clipboard_client_can_send {};
       bool clipboard_client_can_receive {};
-      std::uint8_t clipboard_protocol_version {};
       std::uint8_t clipboard_client_capabilities {};
       std::uint32_t clipboard_next_sequence {1};
       std::uint32_t clipboard_last_local_hash {};
@@ -1050,98 +1002,20 @@ namespace stream {
     return sequence;
   }
 
-  int send_clipboard_v1_message(session_t *session, std::uint8_t op, std::uint8_t flags, std::uint32_t sequence, std::string_view content) {
-    if (!session->control.peer) {
-      return -1;
-    }
-
-    if (content.size() > LI_CLIPBOARD_MAX_TEXT_BYTES) {
-      BOOST_LOG(debug) << "Skipping oversized clipboard payload ["sv << content.size() << " bytes]"sv;
-      return -1;
-    }
-
-    const std::uint32_t total_length = static_cast<std::uint32_t>(content.size());
-    const std::uint32_t chunk_size = std::max<std::uint32_t>(1, clipboard::V1_MAX_CHUNK_BYTES);
-    for (std::uint32_t offset = 0; offset <= total_length; offset += chunk_size) {
-      const std::uint32_t remaining = total_length - offset;
-      const std::uint32_t current_chunk = total_length == 0 ? 0 : std::min(chunk_size, remaining);
-
-      std::vector<std::uint8_t> plaintext(sizeof(control_clipboard_t) + current_chunk);
-      auto packet = (control_clipboard_t *) plaintext.data();
-      packet->header.type = packetTypes[IDX_CLIPBOARD];
-      packet->header.payloadLength = static_cast<std::uint16_t>(plaintext.size() - sizeof(control_header_v2));
-      packet->version = LI_CLIPBOARD_VERSION_V1;
-      packet->op = op;
-      packet->mimeType = LI_CLIPBOARD_MIME_TEXT_UTF8;
-      packet->flags = flags;
-      packet->sequence = sequence;
-      packet->totalLength = total_length;
-      packet->chunkOffset = offset;
-      packet->chunkLength = current_chunk;
-
-      if (current_chunk) {
-        std::copy_n(content.data() + offset, current_chunk, packet->data());
-      }
-
-      std::vector<std::uint8_t> encrypted_payload;
-      auto payload = encode_control(session, {(char *) plaintext.data(), plaintext.size()}, encrypted_payload);
-      if (payload.empty()) {
-        return -1;
-      }
-
-      if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
-        TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
-        BOOST_LOG(warning) << "Couldn't send clipboard message to ["sv << addr << ':' << port << ']';
-        return -1;
-      }
-
-      if (total_length == 0 || current_chunk == remaining) {
-        break;
-      }
-    }
-
-    return 0;
-  }
-
-  int send_clipboard_v1_hello(session_t *session) {
-    std::uint8_t flags = 0;
-    if (clipboard_host_capabilities() & LI_CLIPBOARD_CAP_TEXT) {
-      flags = clipboard::V1_FLAG_CAN_SEND | clipboard::V1_FLAG_CAN_RECEIVE;
-    }
-
-    return send_clipboard_v1_message(
-      session,
-      clipboard::V1_OP_HELLO,
-      flags,
-      next_clipboard_sequence(session),
-      {}
-    );
-  }
-
-  int send_clipboard_v1_set(session_t *session, std::string_view content) {
-    return send_clipboard_v1_message(
-      session,
-      clipboard::V1_OP_SET,
-      clipboard::V1_FLAG_CAN_SEND | clipboard::V1_FLAG_CAN_RECEIVE,
-      next_clipboard_sequence(session),
-      content
-    );
-  }
-
-  int send_clipboard_v2_message(session_t *session, std::uint8_t op, std::uint8_t mime_type, std::uint8_t flags, std::uint32_t sequence, std::uint64_t origin_id, std::uint64_t item_id, std::uint32_t total_length, std::uint32_t chunk_offset, const std::uint8_t *data, std::uint32_t data_length) {
+  int send_clipboard_message(session_t *session, std::uint8_t op, std::uint8_t mime_type, std::uint8_t flags, std::uint32_t sequence, std::uint64_t origin_id, std::uint64_t item_id, std::uint32_t total_length, std::uint32_t chunk_offset, const std::uint8_t *data, std::uint32_t data_length) {
     if (!session->control.peer ||
         data_length > LI_CLIPBOARD_MAX_CHUNK_BYTES ||
         (data_length != 0 && data == nullptr)) {
       return -1;
     }
 
-    std::vector<std::uint8_t> plaintext(sizeof(control_header_v2) + LI_CLIPBOARD_V2_HEADER_SIZE + data_length);
+    std::vector<std::uint8_t> plaintext(sizeof(control_header_v2) + LI_CLIPBOARD_HEADER_SIZE + data_length);
     auto control_header = reinterpret_cast<control_header_v2 *>(plaintext.data());
     control_header->type = packetTypes[IDX_CLIPBOARD];
-    control_header->payloadLength = static_cast<std::uint16_t>(LI_CLIPBOARD_V2_HEADER_SIZE + data_length);
+    control_header->payloadLength = static_cast<std::uint16_t>(LI_CLIPBOARD_HEADER_SIZE + data_length);
 
-    LI_CLIPBOARD_V2_HEADER header {
-      LI_CLIPBOARD_VERSION_V2,
+    LI_CLIPBOARD_HEADER header {
+      LI_CLIPBOARD_VERSION,
       op,
       mime_type,
       flags,
@@ -1153,11 +1027,11 @@ namespace stream {
       data_length,
     };
     auto payload = plaintext.data() + sizeof(control_header_v2);
-    if (!LiEncodeClipboardV2Header(payload, LI_CLIPBOARD_V2_HEADER_SIZE, &header)) {
+    if (!LiEncodeClipboardHeader(payload, LI_CLIPBOARD_HEADER_SIZE, &header)) {
       return -1;
     }
     if (data_length != 0) {
-      std::copy_n(data, data_length, payload + LI_CLIPBOARD_V2_HEADER_SIZE);
+      std::copy_n(data, data_length, payload + LI_CLIPBOARD_HEADER_SIZE);
     }
 
     std::vector<std::uint8_t> encrypted_payload;
@@ -1173,16 +1047,16 @@ namespace stream {
     return 0;
   }
 
-  int send_clipboard_v2_control(session_t *session, std::uint8_t op, std::uint8_t mime_type, std::uint8_t flags, std::uint32_t sequence, std::uint64_t origin_id, std::uint64_t item_id, std::uint32_t total_length) {
-    return send_clipboard_v2_message(session, op, mime_type, flags, sequence, origin_id, item_id, total_length, 0, nullptr, 0);
+  int send_clipboard_control(session_t *session, std::uint8_t op, std::uint8_t mime_type, std::uint8_t flags, std::uint32_t sequence, std::uint64_t origin_id, std::uint64_t item_id, std::uint32_t total_length) {
+    return send_clipboard_message(session, op, mime_type, flags, sequence, origin_id, item_id, total_length, 0, nullptr, 0);
   }
 
-  int send_clipboard_v2_data(session_t *session, std::uint32_t sequence, std::uint8_t mime_type, std::uint64_t origin_id, std::uint64_t item_id, const std::vector<std::uint8_t> &data) {
+  int send_clipboard_data(session_t *session, std::uint32_t sequence, std::uint8_t mime_type, std::uint64_t origin_id, std::uint64_t item_id, const std::vector<std::uint8_t> &data) {
     const auto total_length = static_cast<std::uint32_t>(data.size());
     for (std::uint32_t offset = 0; offset <= total_length; offset += LI_CLIPBOARD_MAX_CHUNK_BYTES) {
       const auto remaining = total_length - offset;
       const auto chunk_length = total_length == 0 ? 0 : std::min(remaining, LI_CLIPBOARD_MAX_CHUNK_BYTES);
-      if (send_clipboard_v2_message(session, LI_CLIPBOARD_OP_DATA, mime_type, 0, sequence, origin_id, item_id, total_length, offset, data.empty() ? nullptr : data.data() + offset, chunk_length)) {
+      if (send_clipboard_message(session, LI_CLIPBOARD_OP_DATA, mime_type, 0, sequence, origin_id, item_id, total_length, offset, data.empty() ? nullptr : data.data() + offset, chunk_length)) {
         return -1;
       }
       if (total_length == 0 || chunk_length == remaining) {
@@ -1192,12 +1066,12 @@ namespace stream {
     return 0;
   }
 
-  int send_clipboard_v2_hello(session_t *session) {
-    return send_clipboard_v2_control(session, LI_CLIPBOARD_OP_HELLO, LI_CLIPBOARD_MIME_NONE, clipboard_host_capabilities(), next_clipboard_sequence(session), clipboard_host_origin_id(), 0, 0);
+  int send_clipboard_hello(session_t *session) {
+    return send_clipboard_control(session, LI_CLIPBOARD_OP_HELLO, LI_CLIPBOARD_MIME_NONE, clipboard_host_capabilities(), next_clipboard_sequence(session), clipboard_host_origin_id(), 0, 0);
   }
 
-  void send_clipboard_v2_nack(session_t *session, const LI_CLIPBOARD_V2_HEADER &header) {
-    send_clipboard_v2_control(session, LI_CLIPBOARD_OP_NACK, header.mimeType, 0, header.sequence, header.originId, header.itemId, 0);
+  void send_clipboard_nack(session_t *session, const LI_CLIPBOARD_HEADER &header) {
+    send_clipboard_control(session, LI_CLIPBOARD_OP_NACK, header.mimeType, 0, header.sequence, header.originId, header.itemId, 0);
   }
 
   void reset_clipboard_reassembly(session_t *session) {
@@ -1361,142 +1235,16 @@ namespace stream {
     session->control.clipboard_local_item_id = content.item_id;
     session->control.clipboard_local_mime_type = wire_mime;
     session->control.clipboard_local_data = std::move(wire_data);
-    return send_clipboard_v2_control(session, LI_CLIPBOARD_OP_ANNOUNCE, wire_mime, 0, next_clipboard_sequence(session), content.origin_id, content.item_id, static_cast<std::uint32_t>(session->control.clipboard_local_data.size()));
+    return send_clipboard_control(session, LI_CLIPBOARD_OP_ANNOUNCE, wire_mime, 0, next_clipboard_sequence(session), content.origin_id, content.item_id, static_cast<std::uint32_t>(session->control.clipboard_local_data.size()));
   }
 
-  void handle_clipboard_v1_message(session_t *session, const std::string_view &payload) {
-    if (payload.size() < sizeof(control_clipboard_payload_t)) {
-      BOOST_LOG(debug) << "Clipboard: runt packet"sv;
+  void handle_clipboard_message(session_t *session, const std::string_view &payload) {
+    LI_CLIPBOARD_HEADER header;
+    if (!LiDecodeClipboardHeader(reinterpret_cast<const std::uint8_t *>(payload.data()), payload.size(), &header)) {
       return;
     }
 
-    auto packet = (const control_clipboard_payload_t *) payload.data();
-    const std::uint32_t sequence = packet->sequence;
-    const std::uint32_t total_length = packet->totalLength;
-    const std::uint32_t chunk_offset = packet->chunkOffset;
-    const std::uint32_t chunk_length = packet->chunkLength;
-
-    if (packet->version != LI_CLIPBOARD_VERSION_V1 || packet->mimeType != LI_CLIPBOARD_MIME_TEXT_UTF8) {
-      send_clipboard_v1_message(session, clipboard::V1_OP_NACK, 0, sequence, {});
-      return;
-    }
-
-    if (total_length > LI_CLIPBOARD_MAX_TEXT_BYTES || chunk_length > clipboard::V1_MAX_CHUNK_BYTES ||
-        chunk_offset > total_length || chunk_length > total_length - chunk_offset ||
-        payload.size() != sizeof(control_clipboard_payload_t) + chunk_length) {
-      BOOST_LOG(debug) << "Clipboard: invalid packet bounds"sv;
-      reset_clipboard_reassembly(session);
-      send_clipboard_v1_message(session, clipboard::V1_OP_NACK, 0, sequence, {});
-      return;
-    }
-
-    switch (packet->op) {
-      case clipboard::V1_OP_HELLO:
-        session->control.clipboard_negotiated = true;
-        session->control.clipboard_protocol_version = LI_CLIPBOARD_VERSION_V1;
-        session->control.clipboard_client_can_send = (packet->flags & clipboard::V1_FLAG_CAN_SEND) != 0;
-        session->control.clipboard_client_can_receive = (packet->flags & clipboard::V1_FLAG_CAN_RECEIVE) != 0;
-        session->control.clipboard_last_sequence = platf::clipboard_sequence();
-        send_clipboard_v1_hello(session);
-        break;
-
-      case clipboard::V1_OP_REQUEST:
-        {
-          if (!session->control.clipboard_negotiated ||
-              !session->control.clipboard_client_can_receive ||
-              (clipboard_host_capabilities() & LI_CLIPBOARD_CAP_TEXT) == 0) {
-            send_clipboard_v1_message(session, clipboard::V1_OP_NACK, 0, sequence, {});
-            return;
-          }
-
-          platf::clipboard_content_t content;
-          if (!platf::get_clipboard_content(LI_CLIPBOARD_CAP_TEXT, content) ||
-              content.mime_type != LI_CLIPBOARD_MIME_TEXT_UTF8) {
-            send_clipboard_v1_message(session, clipboard::V1_OP_NACK, 0, sequence, {});
-            return;
-          }
-
-          std::string_view text {reinterpret_cast<const char *>(content.data.data()), content.data.size()};
-          session->control.clipboard_last_local_hash = clipboard_hash(text);
-          send_clipboard_v1_set(session, text);
-        }
-        break;
-
-      case clipboard::V1_OP_SET:
-        if (!session->control.clipboard_negotiated ||
-            !session->control.clipboard_client_can_send ||
-            (clipboard_host_capabilities() & LI_CLIPBOARD_CAP_TEXT) == 0) {
-          send_clipboard_v1_message(session, clipboard::V1_OP_NACK, 0, sequence, {});
-          return;
-        }
-
-        if (chunk_offset == 0) {
-          reset_clipboard_reassembly(session);
-          session->control.clipboard_recv_sequence = sequence;
-          session->control.clipboard_recv_total_length = total_length;
-          session->control.clipboard_recv_buffer.resize(total_length);
-        }
-
-        if (session->control.clipboard_recv_sequence != sequence ||
-            session->control.clipboard_recv_total_length != total_length ||
-            session->control.clipboard_recv_offset != chunk_offset) {
-          reset_clipboard_reassembly(session);
-          send_clipboard_v1_message(session, clipboard::V1_OP_NACK, 0, sequence, {});
-          return;
-        }
-
-        if (chunk_length) {
-          std::copy_n(packet->data(), chunk_length, session->control.clipboard_recv_buffer.data() + chunk_offset);
-        }
-        session->control.clipboard_recv_offset = chunk_offset + chunk_length;
-
-        if (chunk_offset + chunk_length == total_length) {
-          auto content = std::move(session->control.clipboard_recv_buffer);
-          reset_clipboard_reassembly(session);
-
-          std::string_view text {reinterpret_cast<const char *>(content.data()), content.size()};
-          if (!LiIsValidUtf8ClipboardText(content.data(), content.size())) {
-            send_clipboard_v1_message(session, clipboard::V1_OP_NACK, 0, sequence, {});
-            return;
-          }
-          const auto hash = clipboard_hash(text);
-          session->control.clipboard_last_remote_hash = hash;
-          if (hash != session->control.clipboard_last_local_hash) {
-            platf::clipboard_content_t platform_content {
-              .mime_type = LI_CLIPBOARD_MIME_TEXT_UTF8,
-              .origin_id = clipboard_host_origin_id(),
-              .item_id = clipboard_host_item_id.fetch_add(1),
-              .data = std::move(content),
-            };
-            if (!platf::set_clipboard_content(platform_content)) {
-              send_clipboard_v1_message(session, clipboard::V1_OP_NACK, 0, sequence, {});
-              return;
-            }
-            session->control.clipboard_last_local_hash = hash;
-            session->control.clipboard_last_sequence = platf::clipboard_sequence();
-          }
-
-          send_clipboard_v1_message(session, clipboard::V1_OP_ACK, 0, sequence, {});
-        }
-        break;
-
-      case clipboard::V1_OP_ACK:
-      case clipboard::V1_OP_NACK:
-        break;
-
-      default:
-        send_clipboard_v1_message(session, clipboard::V1_OP_NACK, 0, sequence, {});
-        break;
-    }
-  }
-
-  void handle_clipboard_v2_message(session_t *session, const std::string_view &payload) {
-    LI_CLIPBOARD_V2_HEADER header;
-    if (!LiDecodeClipboardV2Header(reinterpret_cast<const std::uint8_t *>(payload.data()), payload.size(), &header)) {
-      return;
-    }
-
-    const auto *chunk_data = reinterpret_cast<const std::uint8_t *>(payload.data()) + LI_CLIPBOARD_V2_HEADER_SIZE;
+    const auto *chunk_data = reinterpret_cast<const std::uint8_t *>(payload.data()) + LI_CLIPBOARD_HEADER_SIZE;
     const auto size_limit = LiGetClipboardMimeSizeLimit(header.mimeType);
     constexpr std::uint8_t known_capabilities =
       LI_CLIPBOARD_CAP_CAN_SEND |
@@ -1507,12 +1255,12 @@ namespace stream {
       LI_CLIPBOARD_CAP_FILES |
       LI_CLIPBOARD_CAP_FILE_STREAMS;
     const auto client_capabilities = header.flags & known_capabilities;
-    if (header.version != LI_CLIPBOARD_VERSION_V2 ||
+    if (header.version != LI_CLIPBOARD_VERSION ||
         header.chunkLength > LI_CLIPBOARD_MAX_CHUNK_BYTES ||
         header.chunkOffset > header.totalLength ||
         header.chunkLength > header.totalLength - header.chunkOffset ||
-        payload.size() != LI_CLIPBOARD_V2_HEADER_SIZE + header.chunkLength) {
-      send_clipboard_v2_nack(session, header);
+        payload.size() != LI_CLIPBOARD_HEADER_SIZE + header.chunkLength) {
+      send_clipboard_nack(session, header);
       return;
     }
 
@@ -1530,25 +1278,24 @@ namespace stream {
             ((client_capabilities & LI_CLIPBOARD_CAP_BLOB) != 0 &&
              (client_capabilities & (LI_CLIPBOARD_CAP_PNG |
                                      LI_CLIPBOARD_CAP_FILES)) == 0)) {
-          send_clipboard_v2_nack(session, header);
+          send_clipboard_nack(session, header);
           return;
         }
         if (((client_capabilities & LI_CLIPBOARD_CAP_FILES) != 0) !=
             ((client_capabilities & LI_CLIPBOARD_CAP_FILE_STREAMS) != 0)) {
-          send_clipboard_v2_nack(session, header);
+          send_clipboard_nack(session, header);
           return;
         }
 
         unregister_clipboard_origin(session->control.clipboard_client_origin_id, session->control.clipboard_client_capabilities);
         session->control.clipboard_client_origin_id = header.originId;
-        session->control.clipboard_protocol_version = LI_CLIPBOARD_VERSION_V2;
         session->control.clipboard_client_capabilities = client_capabilities;
         register_clipboard_origin(header.originId, client_capabilities);
         session->control.clipboard_client_can_send = (client_capabilities & LI_CLIPBOARD_CAP_CAN_SEND) != 0;
         session->control.clipboard_client_can_receive = (client_capabilities & LI_CLIPBOARD_CAP_CAN_RECEIVE) != 0;
         session->control.clipboard_negotiated = true;
         session->control.clipboard_last_sequence = platf::clipboard_sequence();
-        send_clipboard_v2_hello(session);
+        send_clipboard_hello(session);
         break;
 
       case LI_CLIPBOARD_OP_ANNOUNCE:
@@ -1563,7 +1310,7 @@ namespace stream {
             header.chunkLength != 0 ||
             !LiIsClipboardMimeSupported(header.mimeType, session->control.clipboard_client_capabilities) ||
             !LiIsClipboardMimeSupported(header.mimeType, clipboard_host_capabilities())) {
-          send_clipboard_v2_nack(session, header);
+          send_clipboard_nack(session, header);
           return;
         }
 
@@ -1571,7 +1318,7 @@ namespace stream {
         session->control.clipboard_requested_origin_id = header.originId;
         session->control.clipboard_requested_item_id = header.itemId;
         session->control.clipboard_requested_mime_type = header.mimeType;
-        send_clipboard_v2_control(session, LI_CLIPBOARD_OP_REQUEST, header.mimeType, 0, header.sequence, header.originId, header.itemId, header.totalLength);
+        send_clipboard_control(session, LI_CLIPBOARD_OP_REQUEST, header.mimeType, 0, header.sequence, header.originId, header.itemId, header.totalLength);
         break;
 
       case LI_CLIPBOARD_OP_REQUEST:
@@ -1581,8 +1328,8 @@ namespace stream {
             header.itemId != session->control.clipboard_local_item_id ||
             header.mimeType != session->control.clipboard_local_mime_type ||
             header.totalLength != session->control.clipboard_local_data.size() ||
-            send_clipboard_v2_data(session, header.sequence, header.mimeType, header.originId, header.itemId, session->control.clipboard_local_data)) {
-          send_clipboard_v2_nack(session, header);
+            send_clipboard_data(session, header.sequence, header.mimeType, header.originId, header.itemId, session->control.clipboard_local_data)) {
+          send_clipboard_nack(session, header);
         }
         break;
 
@@ -1594,7 +1341,7 @@ namespace stream {
             size_limit == 0 ||
             header.totalLength > size_limit) {
           reset_clipboard_reassembly(session);
-          send_clipboard_v2_nack(session, header);
+          send_clipboard_nack(session, header);
           return;
         }
 
@@ -1615,7 +1362,7 @@ namespace stream {
             session->control.clipboard_recv_total_length != header.totalLength ||
             session->control.clipboard_recv_offset != header.chunkOffset) {
           reset_clipboard_reassembly(session);
-          send_clipboard_v2_nack(session, header);
+          send_clipboard_nack(session, header);
           return;
         }
 
@@ -1633,7 +1380,7 @@ namespace stream {
           if (applied) {
             session->control.clipboard_last_sequence = platf::clipboard_sequence();
           }
-          send_clipboard_v2_control(session, applied ? LI_CLIPBOARD_OP_ACK : LI_CLIPBOARD_OP_NACK, header.mimeType, 0, header.sequence, header.originId, header.itemId, 0);
+          send_clipboard_control(session, applied ? LI_CLIPBOARD_OP_ACK : LI_CLIPBOARD_OP_NACK, header.mimeType, 0, header.sequence, header.originId, header.itemId, 0);
         }
         break;
 
@@ -1652,20 +1399,8 @@ namespace stream {
         break;
 
       default:
-        send_clipboard_v2_nack(session, header);
+        send_clipboard_nack(session, header);
         break;
-    }
-  }
-
-  void handle_clipboard_message(session_t *session, const std::string_view &payload) {
-    if (payload.empty()) {
-      return;
-    }
-    const auto version = static_cast<std::uint8_t>(payload.front());
-    if (version == LI_CLIPBOARD_VERSION_V2) {
-      handle_clipboard_v2_message(session, payload);
-    } else if (version == LI_CLIPBOARD_VERSION_V1) {
-      handle_clipboard_v1_message(session, payload);
     }
   }
 
@@ -1680,24 +1415,6 @@ namespace stream {
       return;
     }
     session->control.clipboard_last_sequence = sequence;
-
-    if (session->control.clipboard_protocol_version == LI_CLIPBOARD_VERSION_V1) {
-      platf::clipboard_content_t content;
-      if (!platf::get_clipboard_content(LI_CLIPBOARD_CAP_TEXT, content) ||
-          content.mime_type != LI_CLIPBOARD_MIME_TEXT_UTF8 ||
-          content.data.size() > LI_CLIPBOARD_MAX_TEXT_BYTES) {
-        return;
-      }
-      std::string_view text {reinterpret_cast<const char *>(content.data.data()), content.data.size()};
-      const auto hash = clipboard_hash(text);
-      if (hash == session->control.clipboard_last_local_hash ||
-          hash == session->control.clipboard_last_remote_hash) {
-        return;
-      }
-      session->control.clipboard_last_local_hash = hash;
-      send_clipboard_v1_set(session, text);
-      return;
-    }
 
     const auto allowed_capabilities = session->control.clipboard_client_capabilities &
                                       clipboard_host_capabilities();

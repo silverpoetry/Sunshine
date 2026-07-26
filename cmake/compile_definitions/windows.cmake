@@ -102,6 +102,7 @@ list(PREPEND PLATFORM_LIBRARIES
         ntdll
         ole32
         setupapi
+        shell32
         shlwapi
         synchronization.lib
         userenv
