@@ -1,7 +1,7 @@
 #include "clipboard_virtual_files.h"
 
 #include "../../clipboard_file_store.h"
-#include "src/logging.h"
+#include "clipboard_user_helper.h"
 #include "src/utility.h"
 #include "utf_utils.h"
 
@@ -20,7 +20,6 @@
 #include <thread>
 #include <variant>
 #include <windows.h>
-#include <wtsapi32.h>
 
 extern "C" {
 #include <moonlight-common-c/src/Clipboard.h>
@@ -852,37 +851,6 @@ namespace platf::windows {
           return;
         }
 
-        // Sunshine's service places its LocalSystem token in the interactive
-        // session. OLE clipboard owners may still reject data requests from
-        // that identity, so keep this apartment impersonating the console user.
-        HANDLE user_token = nullptr;
-        bool impersonating_user = false;
-        const DWORD console_session_id = WTSGetActiveConsoleSessionId();
-        if (console_session_id != 0xFFFFFFFF &&
-            WTSQueryUserToken(console_session_id, &user_token)) {
-          if (!ImpersonateLoggedOnUser(user_token)) {
-            BOOST_LOG(error)
-              << "Failed to impersonate the interactive user for OLE clipboard access: "
-              << GetLastError();
-            CloseHandle(user_token);
-            user_token = nullptr;
-          } else {
-            impersonating_user = true;
-          }
-        }
-
-        const auto restore_identity = [&]() {
-          if (impersonating_user && !RevertToSelf()) {
-            BOOST_LOG(fatal)
-              << "Failed to revert OLE clipboard thread impersonation: "
-              << GetLastError();
-            DebugBreak();
-          }
-          if (user_token) {
-            CloseHandle(user_token);
-          }
-        };
-
         const auto initialize_result = OleInitialize(nullptr);
         {
           std::lock_guard lock(mutex_);
@@ -891,7 +859,6 @@ namespace platf::windows {
         }
         ready_.notify_all();
         if (!ole_available_) {
-          restore_identity();
           return;
         }
 
@@ -943,7 +910,6 @@ namespace platf::windows {
           }
         }
         OleUninitialize();
-        restore_identity();
       }
 
       HANDLE wake_event_;
@@ -964,6 +930,9 @@ namespace platf::windows {
 
   bool get_file_clipboard_paths(std::vector<std::filesystem::path> &paths) {
     paths.clear();
+    if (get_user_file_clipboard_paths(paths)) {
+      return true;
+    }
     return clipboard_broker().get_file_paths(paths);
   }
 

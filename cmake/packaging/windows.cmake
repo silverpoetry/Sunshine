@@ -34,6 +34,7 @@ install(TARGETS audio-info RUNTIME DESTINATION "tools" COMPONENT audio)
 # Mandatory tools
 install(TARGETS sunshinesvc RUNTIME DESTINATION "tools" COMPONENT application)
 install(TARGETS sunshine-wgc-helper RUNTIME DESTINATION "tools" COMPONENT application)
+install(TARGETS sunshine-clipboard-helper RUNTIME DESTINATION "tools" COMPONENT application)
 
 # Mandatory scripts
 install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/sunshine-setup.ps1"

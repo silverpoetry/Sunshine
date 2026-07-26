@@ -57,3 +57,12 @@ target_link_libraries(sunshine-wgc-helper
         Windowsapp
         ${PLATFORM_LIBRARIES})
 target_compile_options(sunshine-wgc-helper PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+add_executable(sunshine-clipboard-helper clipboard_helper.cpp)
+target_link_libraries(sunshine-clipboard-helper
+        ${CMAKE_THREAD_LIBS_INIT}
+        ole32
+        shell32
+        ${PLATFORM_LIBRARIES})
+target_link_options(sunshine-clipboard-helper PRIVATE -municode)
+target_compile_options(sunshine-clipboard-helper PRIVATE ${SUNSHINE_COMPILE_OPTIONS})

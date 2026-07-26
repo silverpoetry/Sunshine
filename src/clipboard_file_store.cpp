@@ -6,14 +6,24 @@
 #include <condition_variable>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+
+#include "logging.h"
+#include "utility.h"
+
+#ifdef _WIN32
+  #include <windows.h>
+  #include <wtsapi32.h>
+#endif
 
 extern "C" {
 #include <moonlight-common-c/src/Clipboard.h>
@@ -63,6 +73,79 @@ namespace clipboard_file_store {
     std::condition_variable request_available;
     std::unordered_map<std::string, entry_t> entries;
     std::unordered_map<std::string, std::string> idempotency_entries;
+
+#ifdef _WIN32
+    std::optional<bool> is_local_system_process() {
+      HANDLE token {};
+      if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return std::nullopt;
+      }
+      auto token_guard = util::fail_guard([token]() {
+        CloseHandle(token);
+      });
+
+      DWORD size = 0;
+      GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+      std::vector<std::uint8_t> buffer(size);
+      if (size == 0 ||
+          !GetTokenInformation(token, TokenUser, buffer.data(), size, &size)) {
+        return std::nullopt;
+      }
+
+      std::array<std::uint8_t, SECURITY_MAX_SID_SIZE> system_sid {};
+      DWORD system_sid_size = static_cast<DWORD>(system_sid.size());
+      if (!CreateWellKnownSid(
+            WinLocalSystemSid,
+            nullptr,
+            system_sid.data(),
+            &system_sid_size
+          )) {
+        return std::nullopt;
+      }
+
+      const auto *user = reinterpret_cast<const TOKEN_USER *>(buffer.data());
+      return EqualSid(user->User.Sid, system_sid.data());
+    }
+#endif
+
+    template<typename Function>
+    auto with_current_user_file_access(Function &&function)
+      -> std::optional<std::invoke_result_t<Function>> {
+#ifdef _WIN32
+      const auto system_process = is_local_system_process();
+      if (!system_process) {
+        BOOST_LOG(error) << "Failed to determine the Sunshine process identity";
+        return std::nullopt;
+      }
+      if (*system_process) {
+        const DWORD session_id = WTSGetActiveConsoleSessionId();
+        HANDLE token {};
+        if (session_id == 0xFFFFFFFF ||
+            !WTSQueryUserToken(session_id, &token)) {
+          BOOST_LOG(error) << "Failed to query the interactive user for file access: "
+                           << GetLastError();
+          return std::nullopt;
+        }
+        auto token_guard = util::fail_guard([token]() {
+          CloseHandle(token);
+        });
+        if (!ImpersonateLoggedOnUser(token)) {
+          BOOST_LOG(error) << "Failed to impersonate the interactive user for file access: "
+                           << GetLastError();
+          return std::nullopt;
+        }
+        auto impersonation_guard = util::fail_guard([]() {
+          if (!RevertToSelf()) {
+            BOOST_LOG(fatal) << "Failed to revert file access impersonation: "
+                             << GetLastError();
+            DebugBreak();
+          }
+        });
+        return std::invoke(std::forward<Function>(function));
+      }
+#endif
+      return std::invoke(std::forward<Function>(function));
+    }
 
     std::string idempotency_map_key(std::uint64_t origin_id, const std::string &key) {
       return std::to_string(origin_id) + ':' + key;
@@ -388,6 +471,72 @@ namespace clipboard_file_store {
         .manifest_sha256 = existing->second.manifest_sha256,
       };
     }
+
+    chunk_result_t read_local_chunk(
+      const std::string &id,
+      std::uint32_t file_index,
+      std::uint64_t offset,
+      std::size_t length
+    ) {
+      try {
+        file_t file;
+        {
+          std::lock_guard lock(store_mutex);
+          sweep_locked(clock_t::now());
+          auto position = entries.find(id);
+          if (position == entries.end() ||
+              position->second.remote_source ||
+              file_index >= position->second.files.size()) {
+            return {.error = "not_found"};
+          }
+          auto &entry = position->second;
+          file = entry.files[file_index];
+          if (file.type != LI_CLIPBOARD_FILE_TYPE_REGULAR ||
+              offset > file.size ||
+              length > file.size - offset) {
+            return {.error = "bad_file_range"};
+          }
+          entry.expires_at =
+            clock_t::now() + std::chrono::seconds(source_ttl_seconds);
+        }
+
+        std::error_code fs_error;
+        if (!fs::is_regular_file(file.path, fs_error) ||
+            fs::file_size(file.path, fs_error) != file.size ||
+            (file.modified_time &&
+             fs::last_write_time(file.path, fs_error) !=
+               *file.modified_time) ||
+            fs_error) {
+          return {.error = "source_changed"};
+        }
+
+        std::ifstream input(file.path, std::ios::binary);
+        std::vector<std::uint8_t> bytes(length);
+        input.seekg(static_cast<std::streamoff>(offset));
+        input.read(
+          reinterpret_cast<char *>(bytes.data()),
+          static_cast<std::streamsize>(length)
+        );
+        if (!input ||
+            static_cast<std::size_t>(input.gcount()) != length) {
+          return {.error = "read_failed"};
+        }
+        if (fs::file_size(file.path, fs_error) != file.size ||
+            (file.modified_time &&
+             fs::last_write_time(file.path, fs_error) !=
+               *file.modified_time) ||
+            fs_error) {
+          return {.error = "source_changed"};
+        }
+        return {
+          .ok = true,
+          .bytes = bytes,
+          .sha256 = calculate_sha256(bytes.data(), bytes.size()),
+        };
+      } catch (const std::exception &error) {
+        return {.error = error.what()};
+      }
+    }
   }  // namespace
 
   reference_result_t register_sources(const std::vector<fs::path> &paths, std::uint64_t origin_id, std::string idempotency_key) {
@@ -398,7 +547,13 @@ namespace clipboard_file_store {
     try {
       std::vector<file_t> files;
       std::string error;
-      if (!enumerate_sources(paths, files, error)) {
+      const auto enumerated = with_current_user_file_access([&]() {
+        return enumerate_sources(paths, files, error);
+      });
+      if (!enumerated) {
+        return {.error = "user_file_access_unavailable"};
+      }
+      if (!*enumerated) {
         return {.error = std::move(error)};
       }
 
@@ -747,57 +902,13 @@ namespace clipboard_file_store {
       return {.error = "bad_chunk_size"};
     }
 
-    try {
-      file_t file;
-      {
-        std::lock_guard lock(store_mutex);
-        sweep_locked(clock_t::now());
-        auto position = entries.find(id);
-        if (position == entries.end() ||
-            position->second.remote_source ||
-            file_index >= position->second.files.size()) {
-          return {.error = "not_found"};
-        }
-        auto &entry = position->second;
-        file = entry.files[file_index];
-        if (file.type != LI_CLIPBOARD_FILE_TYPE_REGULAR ||
-            offset > file.size ||
-            length > file.size - offset) {
-          return {.error = "bad_file_range"};
-        }
-        entry.expires_at = clock_t::now() + std::chrono::seconds(source_ttl_seconds);
-      }
-
-      std::error_code fs_error;
-      if (!fs::is_regular_file(file.path, fs_error) ||
-          fs::file_size(file.path, fs_error) != file.size ||
-          (file.modified_time &&
-           fs::last_write_time(file.path, fs_error) != *file.modified_time) ||
-          fs_error) {
-        return {.error = "source_changed"};
-      }
-
-      std::ifstream input(file.path, std::ios::binary);
-      std::vector<std::uint8_t> bytes(length);
-      input.seekg(static_cast<std::streamoff>(offset));
-      input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(length));
-      if (!input || static_cast<std::size_t>(input.gcount()) != length) {
-        return {.error = "read_failed"};
-      }
-      if (fs::file_size(file.path, fs_error) != file.size ||
-          (file.modified_time &&
-           fs::last_write_time(file.path, fs_error) != *file.modified_time) ||
-          fs_error) {
-        return {.error = "source_changed"};
-      }
-      return {
-        .ok = true,
-        .bytes = bytes,
-        .sha256 = calculate_sha256(bytes.data(), bytes.size()),
-      };
-    } catch (const std::exception &error) {
-      return {.error = error.what()};
+    auto result = with_current_user_file_access([&]() {
+      return read_local_chunk(id, file_index, offset, length);
+    });
+    if (!result) {
+      return {.error = "user_file_access_unavailable"};
     }
+    return std::move(*result);
   }
 
   void sweep_expired() {
