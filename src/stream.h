@@ -27,6 +27,9 @@ namespace stream {
   // requests are tied to a live Clipboard v2 negotiation that included BLOB.
   bool is_clipboard_origin_active(std::uint64_t origin_id);
 
+  // File endpoints additionally require negotiated streamed-file support.
+  bool is_clipboard_file_origin_active(std::uint64_t origin_id);
+
   struct config_t {
     audio::config_t audio;
     video::config_t monitor;

@@ -991,6 +991,7 @@ namespace platf {
     std::uint64_t item_id {};
     std::vector<std::uint8_t> data;
     std::vector<std::filesystem::path> paths;
+    std::string file_transfer_id;
   };
 
   /**

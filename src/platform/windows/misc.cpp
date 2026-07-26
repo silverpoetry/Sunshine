@@ -43,6 +43,7 @@
 #include <Shlwapi.h>
 
 // local includes
+#include "clipboard_virtual_files.h"
 #include "misc.h"
 #include "nvprefs/nvprefs_interface.h"
 #include "src/entry_handler.h"
@@ -1938,6 +1939,7 @@ namespace platf {
       sizeof(BITMAPV5HEADER) + 4ULL * LI_CLIPBOARD_MAX_IMAGE_PIXELS;
 
 #pragma pack(push, 1)
+
     struct clipboard_identity_t {
       std::uint32_t magic;
       std::uint8_t mime_type;
@@ -1945,6 +1947,7 @@ namespace platf {
       std::uint64_t origin_id;
       std::uint64_t item_id;
     };
+
 #pragma pack(pop)
 
     UINT clipboard_png_format() {
@@ -1977,11 +1980,7 @@ namespace platf {
           return;
         }
 
-        CoCreateInstance(CLSID_WICImagingFactory,
-                         nullptr,
-                         CLSCTX_INPROC_SERVER,
-                         IID_IWICImagingFactory,
-                         reinterpret_cast<void **>(&factory_));
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory, reinterpret_cast<void **>(&factory_));
       }
 
       ~clipboard_wic_context_t() {
@@ -2006,8 +2005,7 @@ namespace platf {
       IWICImagingFactory *factory_ {};
     };
 
-    bool png_to_dibv5(const std::vector<std::uint8_t> &png,
-                      std::vector<std::uint8_t> &dib) {
+    bool png_to_dibv5(const std::vector<std::uint8_t> &png, std::vector<std::uint8_t> &dib) {
       if (png.empty() || png.size() > clipboard_max_host_bytes ||
           !LiIsValidClipboardPngHeader(png.data(), png.size())) {
         return false;
@@ -2028,7 +2026,11 @@ namespace platf {
 
       IWICBitmapDecoder *decoder = nullptr;
       if (FAILED(wic.factory()->CreateDecoderFromStream(
-            stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder))) {
+            stream,
+            nullptr,
+            WICDecodeMetadataCacheOnLoad,
+            &decoder
+          ))) {
         return false;
       }
       auto release_decoder = util::fail_guard([decoder]() {
@@ -2060,12 +2062,7 @@ namespace platf {
         converter->Release();
       });
 
-      if (FAILED(converter->Initialize(frame,
-                                       GUID_WICPixelFormat32bppBGRA,
-                                       WICBitmapDitherTypeNone,
-                                       nullptr,
-                                       0.0,
-                                       WICBitmapPaletteTypeCustom))) {
+      if (FAILED(converter->Initialize(frame, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
         return false;
       }
 
@@ -2095,7 +2092,8 @@ namespace platf {
         nullptr,
         static_cast<UINT>(stride),
         static_cast<UINT>(image_bytes),
-        dib.data() + sizeof(BITMAPV5HEADER)));
+        dib.data() + sizeof(BITMAPV5HEADER)
+      ));
     }
 
     bool dibv5_to_png(std::vector<std::uint8_t> &png) {
@@ -2148,9 +2146,7 @@ namespace platf {
       if (signed_height > 0) {
         top_down.resize(static_cast<std::size_t>(image_bytes));
         for (std::uint64_t row = 0; row < height; ++row) {
-          std::memcpy(top_down.data() + row * stride,
-                      source + (height - row - 1) * stride,
-                      static_cast<std::size_t>(stride));
+          std::memcpy(top_down.data() + row * stride, source + (height - row - 1) * stride, static_cast<std::size_t>(stride));
         }
         source = top_down.data();
       }
@@ -2168,7 +2164,8 @@ namespace platf {
             static_cast<UINT>(stride),
             static_cast<UINT>(image_bytes),
             const_cast<BYTE *>(source),
-            &bitmap))) {
+            &bitmap
+          ))) {
         return false;
       }
       auto release_bitmap = util::fail_guard([bitmap]() {
@@ -2185,7 +2182,10 @@ namespace platf {
 
       IWICBitmapEncoder *encoder = nullptr;
       if (FAILED(wic.factory()->CreateEncoder(
-            GUID_ContainerFormatPng, nullptr, &encoder))) {
+            GUID_ContainerFormatPng,
+            nullptr,
+            &encoder
+          ))) {
         return false;
       }
       auto release_encoder = util::fail_guard([encoder]() {
@@ -2312,7 +2312,8 @@ namespace platf {
     return LI_CLIPBOARD_CAP_TEXT |
            LI_CLIPBOARD_CAP_PNG |
            LI_CLIPBOARD_CAP_BLOB |
-           LI_CLIPBOARD_CAP_FILES;
+           LI_CLIPBOARD_CAP_FILES |
+           LI_CLIPBOARD_CAP_FILE_STREAMS;
   }
 
   std::uint64_t clipboard_sequence() {
@@ -2431,6 +2432,15 @@ namespace platf {
       return false;
     }
 
+    if (content.mime_type == LI_CLIPBOARD_MIME_FILE_MANIFEST) {
+      if (content.data.empty() ||
+          content.file_transfer_id.empty() ||
+          !LiIsValidClipboardFileManifest(content.data.data(), content.data.size())) {
+        return false;
+      }
+      return windows::set_virtual_file_clipboard(content.data, content.file_transfer_id, content.origin_id, content.item_id);
+    }
+
     std::vector<std::uint8_t> dibv5;
     if (content.mime_type == LI_CLIPBOARD_MIME_PNG &&
         content.data.size() <= clipboard_max_host_bytes &&
@@ -2452,44 +2462,7 @@ namespace platf {
     }
 
     bool content_written = false;
-    if (content.mime_type == LI_CLIPBOARD_MIME_FILE_MANIFEST &&
-        !content.paths.empty() &&
-        content.paths.size() <= LI_CLIPBOARD_MAX_FILE_ENTRIES) {
-      std::vector<std::wstring> paths;
-      std::size_t bytes = sizeof(DROPFILES) + sizeof(wchar_t);
-      paths.reserve(content.paths.size());
-      for (const auto &path : content.paths) {
-        std::error_code error;
-        auto absolute = std::filesystem::absolute(path, error);
-        if (error || !std::filesystem::exists(absolute, error) || error) {
-          paths.clear();
-          break;
-        }
-        auto wide = absolute.wstring();
-        if (wide.empty() ||
-            bytes > 4ULL * 1024ULL * 1024ULL - (wide.size() + 1) * sizeof(wchar_t)) {
-          paths.clear();
-          break;
-        }
-        bytes += (wide.size() + 1) * sizeof(wchar_t);
-        paths.push_back(std::move(wide));
-      }
-
-      if (!paths.empty()) {
-        std::vector<std::uint8_t> drop_data(bytes, 0);
-        auto drop_files = reinterpret_cast<DROPFILES *>(drop_data.data());
-        drop_files->pFiles = sizeof(DROPFILES);
-        drop_files->fWide = TRUE;
-        auto destination = reinterpret_cast<wchar_t *>(drop_data.data() + sizeof(DROPFILES));
-        for (const auto &path : paths) {
-          std::copy(path.begin(), path.end(), destination);
-          destination += path.size() + 1;
-        }
-        content_written = set_global_clipboard_data(CF_HDROP,
-                                                    drop_data.data(),
-                                                    drop_data.size());
-      }
-    } else if (content.mime_type == LI_CLIPBOARD_MIME_TEXT_UTF8 &&
+    if (content.mime_type == LI_CLIPBOARD_MIME_TEXT_UTF8 &&
         content.data.size() <= LI_CLIPBOARD_MAX_TEXT_BYTES &&
         LiIsValidUtf8ClipboardText(content.data.data(), content.data.size())) {
       try {
@@ -2503,9 +2476,7 @@ namespace platf {
     } else if (content.mime_type == LI_CLIPBOARD_MIME_PNG &&
                content.data.size() <= clipboard_max_host_bytes &&
                LiIsValidClipboardPngHeader(content.data.data(), content.data.size())) {
-      content_written = set_global_clipboard_data(clipboard_png_format(),
-                                                  content.data.data(),
-                                                  content.data.size());
+      content_written = set_global_clipboard_data(clipboard_png_format(), content.data.data(), content.data.size());
       if (!dibv5.empty()) {
         content_written =
           set_global_clipboard_data(CF_DIBV5, dibv5.data(), dibv5.size()) ||
