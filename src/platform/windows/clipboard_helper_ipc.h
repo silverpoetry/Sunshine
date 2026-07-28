@@ -9,7 +9,7 @@
 
 namespace platf::windows::clipboard_helper {
   constexpr std::uint32_t protocol_magic = 0x434C5048;  // CLPH
-  constexpr std::uint32_t protocol_version = 2;
+  constexpr std::uint32_t protocol_version = 3;
   constexpr std::uint32_t max_path_chars = 32767;
   constexpr std::uint32_t max_transfer_id_bytes = 256;
   constexpr std::size_t max_response_bytes = 16ULL * 1024ULL * 1024ULL;
@@ -35,15 +35,19 @@ namespace platf::windows::clipboard_helper {
   enum class message_type: std::uint32_t {
     publish_request = 1,
     publish_ready = 2,
-    chunk_request = 3,
-    chunk_response = 4,
+    file_request = 3,
+    file_response = 4,
+  };
+
+  enum class file_request_kind: std::uint32_t {
+    manifest = 1,
+    chunk = 2,
   };
 
   struct publish_request_header {
     std::uint32_t magic;
     std::uint32_t version;
     message_type type;
-    std::uint32_t manifest_size;
     std::uint32_t transfer_id_size;
     std::uint64_t origin_id;
     std::uint64_t item_id;
@@ -57,16 +61,17 @@ namespace platf::windows::clipboard_helper {
     std::uint32_t detail;
   };
 
-  struct chunk_request_message {
+  struct file_request_message {
     std::uint32_t magic;
     std::uint32_t version;
     message_type type;
+    file_request_kind kind;
     std::uint32_t file_index;
     std::uint64_t offset;
     std::uint32_t length;
   };
 
-  struct chunk_response_header {
+  struct file_response_header {
     std::uint32_t magic;
     std::uint32_t version;
     message_type type;
@@ -78,8 +83,8 @@ namespace platf::windows::clipboard_helper {
 #pragma pack(pop)
 
   static_assert(sizeof(response_header) == 20);
-  static_assert(sizeof(publish_request_header) == 36);
+  static_assert(sizeof(publish_request_header) == 32);
   static_assert(sizeof(publish_ready_message) == 20);
-  static_assert(sizeof(chunk_request_message) == 28);
-  static_assert(sizeof(chunk_response_header) == 24);
+  static_assert(sizeof(file_request_message) == 32);
+  static_assert(sizeof(file_response_header) == 24);
 }  // namespace platf::windows::clipboard_helper

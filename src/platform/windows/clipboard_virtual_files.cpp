@@ -252,7 +252,7 @@ namespace platf::windows {
             return STG_E_READFAULT;
           }
 #else
-          auto result = clipboard_file_store::request_remote_chunk(
+          auto result = clipboard_file_store::read_chunk(
             transfer_id_,
             origin_id_,
             file_index_,
@@ -518,13 +518,12 @@ namespace platf::windows {
         public IDataObject,
         public IDataObjectAsyncCapability {
     public:
-      virtual_file_data_object_t(std::vector<file_entry_t> files, std::string transfer_id, std::uint64_t origin_id, std::uint64_t item_id):
-          files_(std::move(files)),
+      virtual_file_data_object_t(std::string transfer_id, std::uint64_t origin_id, std::uint64_t item_id):
           transfer_id_(std::move(transfer_id)),
           origin_id_(origin_id),
           identity_ {
             clipboard_identity_magic,
-            LI_CLIPBOARD_MIME_FILE_MANIFEST,
+            LI_CLIPBOARD_MIME_FILE_OFFER,
             {},
             origin_id,
             item_id,
@@ -536,8 +535,7 @@ namespace platf::windows {
       }
 
       bool valid() const {
-        return !files_.empty() &&
-               !transfer_id_.empty() &&
+        return !transfer_id_.empty() &&
                origin_id_ != 0 &&
                descriptor_format_ != 0 &&
                contents_format_ != 0 &&
@@ -586,10 +584,21 @@ namespace platf::windows {
         }
 
         if (format->cfFormat == descriptor_format_) {
+          if (!ensure_manifest()) {
+            return STG_E_READFAULT;
+          }
           return get_descriptors(*medium);
         }
         if (format->cfFormat == contents_format_) {
+          if (!ensure_manifest()) {
+            return STG_E_READFAULT;
+          }
           const auto index = static_cast<std::size_t>(format->lindex);
+          if (format->lindex < 0 ||
+              index >= files_.size() ||
+              files_[index].type != LI_CLIPBOARD_FILE_TYPE_REGULAR) {
+            return DV_E_LINDEX;
+          }
           const auto &file = files_[index];
           auto stream = new (std::nothrow) virtual_file_stream_t(
             transfer_id_,
@@ -636,9 +645,7 @@ namespace platf::windows {
           if ((format->tymed & TYMED_ISTREAM) == 0) {
             return DV_E_TYMED;
           }
-          if (format->lindex < 0 ||
-              static_cast<std::size_t>(format->lindex) >= files_.size() ||
-              files_[format->lindex].type != LI_CLIPBOARD_FILE_TYPE_REGULAR) {
+          if (format->lindex < 0) {
             return DV_E_LINDEX;
           }
           return S_OK;
@@ -724,6 +731,54 @@ namespace platf::windows {
       }
 
     private:
+      bool ensure_manifest() {
+        {
+          std::unique_lock lock(manifest_mutex_);
+          if (manifest_state_ == manifest_state_e::ready) {
+            return true;
+          }
+          if (manifest_state_ == manifest_state_e::failed) {
+            return false;
+          }
+          if (manifest_state_ == manifest_state_e::loading) {
+            manifest_ready_.wait(lock, [this]() {
+              return manifest_state_ != manifest_state_e::loading;
+            });
+            return manifest_state_ == manifest_state_e::ready;
+          }
+          manifest_state_ = manifest_state_e::loading;
+        }
+
+        std::vector<std::uint8_t> manifest;
+#ifdef SUNSHINE_CLIPBOARD_HELPER
+        const bool fetched =
+          request_virtual_file_manifest_from_service(manifest);
+#else
+        auto result = clipboard_file_store::get_manifest(
+          transfer_id_,
+          origin_id_
+        );
+        const bool fetched = result.ok;
+        if (fetched) {
+          manifest = std::move(result.bytes);
+        }
+#endif
+        std::vector<file_entry_t> files;
+        const bool decoded = fetched && decode_manifest(manifest, files);
+
+        {
+          std::lock_guard lock(manifest_mutex_);
+          if (decoded) {
+            files_ = std::move(files);
+            manifest_state_ = manifest_state_e::ready;
+          } else {
+            manifest_state_ = manifest_state_e::failed;
+          }
+        }
+        manifest_ready_.notify_all();
+        return decoded;
+      }
+
       HRESULT get_descriptors(STGMEDIUM &medium) const {
         const auto size =
           offsetof(FILEGROUPDESCRIPTORW, fgd) + files_.size() * sizeof(FILEDESCRIPTORW);
@@ -764,7 +819,16 @@ namespace platf::windows {
       }
 
       std::atomic_ulong references_ {1};
+      enum class manifest_state_e {
+        empty,
+        loading,
+        ready,
+        failed,
+      };
       std::vector<file_entry_t> files_;
+      std::mutex manifest_mutex_;
+      std::condition_variable manifest_ready_;
+      manifest_state_e manifest_state_ {manifest_state_e::empty};
       std::string transfer_id_;
       std::uint64_t origin_id_;
       clipboard_identity_t identity_;
@@ -810,7 +874,6 @@ namespace platf::windows {
         }
         auto job = std::make_shared<set_job_t>();
         job->object = object;
-        auto result = job->result.get_future();
         {
           std::lock_guard lock(mutex_);
           jobs_.emplace_back(job);
@@ -820,7 +883,7 @@ namespace platf::windows {
             return false;
           }
         }
-        return SUCCEEDED(result.get());
+        return true;
       }
 
       bool get_file_paths(std::vector<std::filesystem::path> &paths) {
@@ -849,7 +912,6 @@ namespace platf::windows {
     private:
       struct set_job_t {
         IDataObject *object {};
-        std::promise<HRESULT> result;
       };
 
       struct get_file_paths_result_t {
@@ -905,9 +967,8 @@ namespace platf::windows {
               std::visit(
                 util::overloaded {
                   [](const std::shared_ptr<set_job_t> &set_job) {
-                    const auto result = OleSetClipboard(set_job->object);
+                    OleSetClipboard(set_job->object);
                     set_job->object->Release();
-                    set_job->result.set_value(result);
                   },
                   [](const std::shared_ptr<get_file_paths_job_t> &get_job) {
                     get_file_paths_result_t result;
@@ -960,10 +1021,9 @@ namespace platf::windows {
     return clipboard_broker().get_file_paths(paths);
   }
 
-  bool set_virtual_file_clipboard(const std::vector<std::uint8_t> &manifest, const std::string &transfer_id, std::uint64_t origin_id, std::uint64_t item_id) {
+  bool set_virtual_file_clipboard(const std::string &transfer_id, std::uint64_t origin_id, std::uint64_t item_id) {
 #ifndef SUNSHINE_CLIPBOARD_HELPER
     const auto user_result = set_user_virtual_file_clipboard(
-      manifest,
       transfer_id,
       origin_id,
       item_id
@@ -973,15 +1033,12 @@ namespace platf::windows {
     }
 #endif
 
-    std::vector<file_entry_t> files;
     if (transfer_id.empty() ||
         origin_id == 0 ||
-        item_id == 0 ||
-        !decode_manifest(manifest, files)) {
+        item_id == 0) {
       return false;
     }
     auto *object = new (std::nothrow) virtual_file_data_object_t(
-      std::move(files),
       transfer_id,
       origin_id,
       item_id

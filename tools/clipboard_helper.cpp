@@ -269,8 +269,6 @@ namespace {
         request.magic != ipc::protocol_magic ||
         request.version != ipc::protocol_version ||
         request.type != ipc::message_type::publish_request ||
-        request.manifest_size == 0 ||
-        request.manifest_size > LI_CLIPBOARD_MAX_FILE_MANIFEST_BYTES ||
         request.transfer_id_size == 0 ||
         request.transfer_id_size > ipc::max_transfer_id_bytes ||
         request.origin_id == 0 ||
@@ -278,21 +276,11 @@ namespace {
       return ERROR_INVALID_DATA;
     }
 
-    std::vector<std::uint8_t> manifest(request.manifest_size);
     std::string transfer_id(request.transfer_id_size, '\0');
     if (!read_exact(
           service_read_pipe,
-          manifest.data(),
-          manifest.size()
-        ) ||
-        !read_exact(
-          service_read_pipe,
           transfer_id.data(),
           transfer_id.size()
-        ) ||
-        !LiIsValidClipboardFileManifest(
-          manifest.data(),
-          manifest.size()
         )) {
       return ERROR_INVALID_DATA;
     }
@@ -304,7 +292,6 @@ namespace {
       .result = ipc::status::clipboard_error,
     };
     if (platf::windows::set_virtual_file_clipboard(
-          manifest,
           transfer_id,
           request.origin_id,
           request.item_id
@@ -335,24 +322,30 @@ namespace {
   }
 }  // namespace
 
-bool platf::windows::request_virtual_file_chunk_from_service(
-  std::uint32_t file_index,
-  std::uint64_t offset,
-  std::size_t length,
-  std::vector<std::uint8_t> &bytes
-) {
+namespace {
+  bool request_virtual_file_payload(
+    ipc::file_request_kind kind,
+    std::uint32_t file_index,
+    std::uint64_t offset,
+    std::size_t length,
+    std::vector<std::uint8_t> &bytes
+  ) {
   if (!service_read_pipe || !service_write_pipe ||
-      length == 0 ||
-      length > LI_CLIPBOARD_MAX_FILE_CHUNK_BYTES ||
+      (kind == ipc::file_request_kind::manifest &&
+       (file_index != 0 || offset != 0 || length != 0)) ||
+      (kind == ipc::file_request_kind::chunk &&
+       (length == 0 ||
+        length > LI_CLIPBOARD_MAX_FILE_CHUNK_BYTES)) ||
       length > (std::numeric_limits<std::uint32_t>::max)()) {
     return false;
   }
 
   std::lock_guard lock(service_pipe_mutex);
-  ipc::chunk_request_message request {
+  ipc::file_request_message request {
     .magic = ipc::protocol_magic,
     .version = ipc::protocol_version,
-    .type = ipc::message_type::chunk_request,
+    .type = ipc::message_type::file_request,
+    .kind = kind,
     .file_index = file_index,
     .offset = offset,
     .length = static_cast<std::uint32_t>(length),
@@ -361,17 +354,53 @@ bool platf::windows::request_virtual_file_chunk_from_service(
     return false;
   }
 
-  ipc::chunk_response_header response {};
+  ipc::file_response_header response {};
   if (!read_exact(service_read_pipe, &response, sizeof(response)) ||
       response.magic != ipc::protocol_magic ||
       response.version != ipc::protocol_version ||
-      response.type != ipc::message_type::chunk_response ||
+      response.type != ipc::message_type::file_response ||
       response.result != ipc::status::success ||
-      response.length != request.length) {
+      (kind == ipc::file_request_kind::manifest &&
+       (response.length == 0 ||
+        response.length > LI_CLIPBOARD_MAX_FILE_MANIFEST_BYTES)) ||
+      (kind == ipc::file_request_kind::chunk &&
+       response.length != request.length)) {
     return false;
   }
   bytes.resize(response.length);
   return read_exact(service_read_pipe, bytes.data(), bytes.size());
+  }
+}  // namespace
+
+bool platf::windows::request_virtual_file_manifest_from_service(
+  std::vector<std::uint8_t> &manifest
+) {
+  return request_virtual_file_payload(
+    ipc::file_request_kind::manifest,
+    0,
+    0,
+    0,
+    manifest
+  ) &&
+         LiIsValidClipboardFileManifest(
+           manifest.data(),
+           manifest.size()
+         );
+}
+
+bool platf::windows::request_virtual_file_chunk_from_service(
+  std::uint32_t file_index,
+  std::uint64_t offset,
+  std::size_t length,
+  std::vector<std::uint8_t> &bytes
+) {
+  return request_virtual_file_payload(
+    ipc::file_request_kind::chunk,
+    file_index,
+    offset,
+    length,
+    bytes
+  );
 }
 
 int wmain(int argc, wchar_t **argv) {

@@ -1100,6 +1100,19 @@ namespace stream {
       if (!LiIsValidClipboardPngHeader(data.data(), data.size())) {
         return false;
       }
+    } else if (mime_type == LI_CLIPBOARD_MIME_FILE_OFFER) {
+      LI_CLIPBOARD_FILE_OFFER offer;
+      if (!LiDecodeClipboardFileOffer(data.data(), data.size(), &offer)) {
+        return false;
+      }
+      content.file_transfer_id.assign(offer.id, offer.idLength);
+      if (!clipboard_file_store::resolve_remote_offer(
+            content.file_transfer_id,
+            origin_id
+          ).ok) {
+        return false;
+      }
+      return platf::set_clipboard_content(content);
     } else if (mime_type == LI_CLIPBOARD_MIME_BLOB_REFERENCE) {
       LI_CLIPBOARD_BLOB_REFERENCE reference;
       if (!LiDecodeClipboardBlobReference(data.data(), data.size(), &reference)) {
@@ -1109,19 +1122,6 @@ namespace stream {
       if (!LiIsClipboardMimeSupported(reference.targetMimeType, client_capabilities)) {
         return false;
       }
-      if (reference.targetMimeType == LI_CLIPBOARD_MIME_FILE_MANIFEST) {
-        clipboard_file_store::digest_t manifest_sha256 {};
-        std::copy_n(reference.sha256, manifest_sha256.size(), manifest_sha256.begin());
-        auto resolved = clipboard_file_store::resolve_remote_source(reference.id, origin_id, reference.size, manifest_sha256);
-        if (!resolved.ok) {
-          return false;
-        }
-        content.mime_type = LI_CLIPBOARD_MIME_FILE_MANIFEST;
-        content.data = std::move(resolved.manifest);
-        content.file_transfer_id.assign(reference.id, reference.idLength);
-        return platf::set_clipboard_content(content);
-      }
-
       auto blob = clipboard_blob_store::get(reference.id);
       if (!blob.found ||
           blob.origin_id != origin_id ||
@@ -1159,43 +1159,43 @@ namespace stream {
 
     std::uint8_t wire_mime = content.mime_type;
     std::vector<std::uint8_t> wire_data = std::move(content.data);
-    if (content.mime_type == LI_CLIPBOARD_MIME_FILE_MANIFEST) {
+    if (content.mime_type == LI_CLIPBOARD_MIME_FILE_OFFER) {
       if (content.paths.empty() ||
           (session->control.clipboard_client_capabilities &
-           (LI_CLIPBOARD_CAP_BLOB |
-            LI_CLIPBOARD_CAP_FILES |
-            LI_CLIPBOARD_CAP_FILE_STREAMS)) !=
-            (LI_CLIPBOARD_CAP_BLOB |
-             LI_CLIPBOARD_CAP_FILES |
+           (LI_CLIPBOARD_CAP_FILES |
+             LI_CLIPBOARD_CAP_FILE_STREAMS)) !=
+            (LI_CLIPBOARD_CAP_FILES |
              LI_CLIPBOARD_CAP_FILE_STREAMS)) {
         return -1;
       }
 
-      auto stored = clipboard_file_store::register_sources(
+      auto stored = clipboard_file_store::register_local_offer(
         content.paths,
         content.origin_id,
         std::to_string(content.origin_id) + ':' + std::to_string(content.item_id)
       );
       if (!stored.ok ||
-          stored.manifest_size == 0 ||
-          stored.manifest_size > UINT32_MAX) {
+          stored.id.empty() ||
+          stored.id.size() > LI_CLIPBOARD_FILE_OFFER_ID_MAX_BYTES) {
         return -1;
       }
 
-      LI_CLIPBOARD_BLOB_REFERENCE reference {};
-      reference.targetMimeType = LI_CLIPBOARD_MIME_FILE_MANIFEST;
-      reference.size = static_cast<std::uint32_t>(stored.manifest_size);
-      reference.idLength = static_cast<std::uint8_t>(stored.id.size());
-      std::copy(stored.id.begin(), stored.id.end(), reference.id);
-      std::copy(stored.manifest_sha256.begin(), stored.manifest_sha256.end(), reference.sha256);
+      LI_CLIPBOARD_FILE_OFFER offer {};
+      offer.idLength = static_cast<std::uint8_t>(stored.id.size());
+      std::copy(stored.id.begin(), stored.id.end(), offer.id);
 
-      wire_data.resize(LI_CLIPBOARD_MAX_BLOB_REFERENCE_BYTES);
+      wire_data.resize(LI_CLIPBOARD_MAX_FILE_OFFER_BYTES);
       std::size_t encoded_length = 0;
-      if (!LiEncodeClipboardBlobReference(wire_data.data(), wire_data.size(), &reference, &encoded_length)) {
+      if (!LiEncodeClipboardFileOffer(
+            wire_data.data(),
+            wire_data.size(),
+            &offer,
+            &encoded_length
+          )) {
         return -1;
       }
       wire_data.resize(encoded_length);
-      wire_mime = LI_CLIPBOARD_MIME_BLOB_REFERENCE;
+      wire_mime = LI_CLIPBOARD_MIME_FILE_OFFER;
     }
 
     const auto inline_limit = LiGetClipboardMimeSizeLimit(wire_mime);

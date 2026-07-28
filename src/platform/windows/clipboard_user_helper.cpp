@@ -9,11 +9,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -351,14 +353,11 @@ namespace platf::windows {
       }
 
       bool start(
-        const std::vector<std::uint8_t> &manifest,
         std::string transfer_id,
         std::uint64_t origin_id,
         std::uint64_t item_id
       ) {
-        if (manifest.empty() ||
-            manifest.size() > LI_CLIPBOARD_MAX_FILE_MANIFEST_BYTES ||
-            transfer_id.empty() ||
+        if (transfer_id.empty() ||
             transfer_id.size() > ipc::max_transfer_id_bytes ||
             origin_id == 0 ||
             item_id == 0) {
@@ -519,19 +518,12 @@ namespace platf::windows {
           .magic = ipc::protocol_magic,
           .version = ipc::protocol_version,
           .type = ipc::message_type::publish_request,
-          .manifest_size =
-            static_cast<std::uint32_t>(manifest.size()),
           .transfer_id_size =
             static_cast<std::uint32_t>(transfer_id_.size()),
           .origin_id = origin_id,
           .item_id = item_id,
         };
         if (!write_exact(service_write_, &request, sizeof(request)) ||
-            !write_exact(
-              service_write_,
-              manifest.data(),
-              manifest.size()
-            ) ||
             !write_exact(
               service_write_,
               transfer_id_.data(),
@@ -599,10 +591,10 @@ namespace platf::windows {
             continue;
           }
 
-          if (prefix.type != ipc::message_type::chunk_request) {
+          if (prefix.type != ipc::message_type::file_request) {
             break;
           }
-          ipc::chunk_request_message request {};
+          ipc::file_request_message request {};
           std::memcpy(&request, &prefix, sizeof(prefix));
           if (!read_exact(
                 service_read_,
@@ -610,63 +602,52 @@ namespace platf::windows {
                   sizeof(prefix),
                 sizeof(request) - sizeof(prefix)
               ) ||
-              request.length == 0 ||
-              request.length > LI_CLIPBOARD_MAX_FILE_CHUNK_BYTES) {
+              (request.kind != ipc::file_request_kind::manifest &&
+               request.kind != ipc::file_request_kind::chunk) ||
+              (request.kind == ipc::file_request_kind::manifest &&
+               (request.file_index != 0 ||
+                request.offset != 0 ||
+                request.length != 0)) ||
+              (request.kind == ipc::file_request_kind::chunk &&
+               (request.length == 0 ||
+                request.length > LI_CLIPBOARD_MAX_FILE_CHUNK_BYTES))) {
             break;
           }
-          const bool first_chunk =
-            !chunk_request_observed_.exchange(true);
-          const auto request_started =
-            std::chrono::steady_clock::now();
-          if (first_chunk) {
-            BOOST_LOG(debug) << "Clipboard file trace transfer="
-                            << transfer_id_
-                            << " phase=first_chunk_requested file="
-                            << request.file_index
-                            << " offset="
-                            << request.offset
-                            << " bytes="
-                            << request.length;
-          }
-
-          auto result = clipboard_file_store::request_remote_chunk(
-            transfer_id_,
-            origin_id_,
-            request.file_index,
-            request.offset,
-            request.length
-          );
-          if (first_chunk) {
-            const auto elapsed =
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - request_started
-              ).count();
-            if (result.ok) {
-              BOOST_LOG(debug) << "Clipboard file trace transfer="
-                              << transfer_id_
-                              << " phase=first_chunk_completed duration_ms="
-                              << elapsed
-                              << " bytes="
-                              << result.bytes.size();
-            } else {
-              BOOST_LOG(warning) << "Clipboard file trace transfer="
-                                 << transfer_id_
-                                 << " phase=first_chunk_failed duration_ms="
-                                 << elapsed
-                                 << " error="
-                                 << result.error;
+          std::vector<std::uint8_t> bytes;
+          bool valid = false;
+          if (request.kind == ipc::file_request_kind::manifest) {
+            auto result = clipboard_file_store::get_manifest(
+              transfer_id_,
+              origin_id_
+            );
+            valid = result.ok;
+            if (valid) {
+              bytes = std::move(result.bytes);
+            }
+          } else {
+            auto result = clipboard_file_store::read_chunk(
+              transfer_id_,
+              origin_id_,
+              request.file_index,
+              request.offset,
+              request.length
+            );
+            valid = result.ok &&
+                    result.bytes.size() == request.length;
+            if (valid) {
+              bytes = std::move(result.bytes);
             }
           }
-          const bool valid =
-            result.ok && result.bytes.size() == request.length;
-          ipc::chunk_response_header response {
+          ipc::file_response_header response {
             .magic = ipc::protocol_magic,
             .version = ipc::protocol_version,
-            .type = ipc::message_type::chunk_response,
+            .type = ipc::message_type::file_response,
             .result = valid ?
                         ipc::status::success :
                         ipc::status::transfer_error,
-            .length = valid ? request.length : 0,
+            .length = valid ?
+                        static_cast<std::uint32_t>(bytes.size()) :
+                        0,
           };
           if (!write_exact(
                 service_write_,
@@ -676,8 +657,8 @@ namespace platf::windows {
               (valid &&
                !write_exact(
                  service_write_,
-                 result.bytes.data(),
-                 result.bytes.size()
+                 bytes.data(),
+                 bytes.size()
                ))) {
             break;
           }
@@ -694,6 +675,12 @@ namespace platf::windows {
 
       void stop() {
         stopping_.store(true);
+        if (!transfer_id_.empty() && origin_id_ != 0) {
+          clipboard_file_store::release_remote_source(
+            transfer_id_,
+            origin_id_
+          );
+        }
         if (stop_event_) {
           SetEvent(stop_event_);
         }
@@ -735,12 +722,132 @@ namespace platf::windows {
       std::atomic_bool ready_reported_ {};
       std::atomic_bool published_ {};
       std::atomic_bool stopping_ {};
-      std::atomic_bool chunk_request_observed_ {};
     };
 
-    std::mutex virtual_clipboard_mutex;
-    std::unique_ptr<virtual_clipboard_session_t>
-      virtual_clipboard_session;
+    class virtual_clipboard_publisher_t {
+    public:
+      virtual_clipboard_publisher_t():
+          worker_([this]() {
+            run();
+          }) {
+      }
+
+      virtual_clipboard_publisher_t(
+        const virtual_clipboard_publisher_t &
+      ) = delete;
+      virtual_clipboard_publisher_t &operator=(
+        const virtual_clipboard_publisher_t &
+      ) = delete;
+
+      ~virtual_clipboard_publisher_t() {
+        {
+          std::lock_guard lock(mutex_);
+          stopping_ = true;
+        }
+        wake_.notify_all();
+        worker_.join();
+      }
+
+      bool publish(
+        std::string transfer_id,
+        std::uint64_t origin_id,
+        std::uint64_t item_id
+      ) {
+        if (transfer_id.empty() ||
+            transfer_id.size() > ipc::max_transfer_id_bytes ||
+            origin_id == 0 ||
+            item_id == 0) {
+          return false;
+        }
+
+        std::lock_guard lock(mutex_);
+        if (stopping_) {
+          return false;
+        }
+        pending_ = publish_job_t {
+          .transfer_id = std::move(transfer_id),
+          .origin_id = origin_id,
+          .item_id = item_id,
+          .generation = ++generation_,
+        };
+        wake_.notify_one();
+        return true;
+      }
+
+    private:
+      struct publish_job_t {
+        std::string transfer_id;
+        std::uint64_t origin_id {};
+        std::uint64_t item_id {};
+        std::uint64_t generation {};
+      };
+
+      void run() {
+        for (;;) {
+          publish_job_t job;
+          {
+            std::unique_lock lock(mutex_);
+            wake_.wait(lock, [this]() {
+              return stopping_ || pending_.has_value();
+            });
+            if (stopping_) {
+              break;
+            }
+            job = std::move(*pending_);
+            pending_.reset();
+          }
+
+          auto next_session =
+            std::make_unique<virtual_clipboard_session_t>();
+          if (!next_session->start(
+                job.transfer_id,
+                job.origin_id,
+                job.item_id
+              )) {
+            continue;
+          }
+
+          std::unique_ptr<virtual_clipboard_session_t>
+            previous_session;
+          bool accepted = false;
+          {
+            std::lock_guard lock(mutex_);
+            if (!stopping_ &&
+                job.generation == generation_) {
+              previous_session = std::move(active_);
+              active_ = std::move(next_session);
+              accepted = true;
+            }
+          }
+          if (!accepted) {
+            next_session.reset();
+            continue;
+          }
+          previous_session.reset();
+        }
+
+        std::unique_ptr<virtual_clipboard_session_t> active;
+        {
+          std::lock_guard lock(mutex_);
+          pending_.reset();
+          active = std::move(active_);
+        }
+        active.reset();
+      }
+
+      std::mutex mutex_;
+      std::condition_variable wake_;
+      std::optional<publish_job_t> pending_;
+      std::unique_ptr<virtual_clipboard_session_t> active_;
+      std::thread worker_;
+      std::uint64_t generation_ {};
+      bool stopping_ {};
+    };
+
+    virtual_clipboard_publisher_t &virtual_clipboard_publisher() {
+      static virtual_clipboard_publisher_t publisher;
+      return publisher;
+    }
   }  // namespace
 
   bool get_user_file_clipboard_paths(
@@ -837,7 +944,6 @@ namespace platf::windows {
   }
 
   user_virtual_clipboard_result set_user_virtual_file_clipboard(
-    const std::vector<std::uint8_t> &manifest,
     const std::string &transfer_id,
     std::uint64_t origin_id,
     std::uint64_t item_id
@@ -846,24 +952,13 @@ namespace platf::windows {
       return user_virtual_clipboard_result::not_required;
     }
 
-    auto next_session =
-      std::make_unique<virtual_clipboard_session_t>();
-    if (!next_session->start(
-          manifest,
+    if (!virtual_clipboard_publisher().publish(
           transfer_id,
           origin_id,
           item_id
         )) {
       return user_virtual_clipboard_result::failure;
     }
-
-    std::unique_ptr<virtual_clipboard_session_t> previous_session;
-    {
-      std::lock_guard lock(virtual_clipboard_mutex);
-      previous_session = std::move(virtual_clipboard_session);
-      virtual_clipboard_session = std::move(next_session);
-    }
-    previous_session.reset();
     return user_virtual_clipboard_result::success;
   }
 }  // namespace platf::windows

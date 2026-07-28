@@ -2325,7 +2325,7 @@ namespace platf {
 
     if ((allowed_capabilities & LI_CLIPBOARD_CAP_FILES) != 0 &&
         windows::get_file_clipboard_paths(content.paths)) {
-      content.mime_type = LI_CLIPBOARD_MIME_FILE_MANIFEST;
+      content.mime_type = LI_CLIPBOARD_MIME_FILE_OFFER;
       return true;
     }
 
@@ -2358,7 +2358,7 @@ namespace platf {
           content.paths.emplace_back(std::move(path));
         }
         if (content.paths.size() == count) {
-          content.mime_type = LI_CLIPBOARD_MIME_FILE_MANIFEST;
+          content.mime_type = LI_CLIPBOARD_MIME_FILE_OFFER;
           read_clipboard_identity(content);
           return true;
         }
@@ -2438,13 +2438,15 @@ namespace platf {
       return false;
     }
 
-    if (content.mime_type == LI_CLIPBOARD_MIME_FILE_MANIFEST) {
-      if (content.data.empty() ||
-          content.file_transfer_id.empty() ||
-          !LiIsValidClipboardFileManifest(content.data.data(), content.data.size())) {
+    if (content.mime_type == LI_CLIPBOARD_MIME_FILE_OFFER) {
+      if (content.file_transfer_id.empty()) {
         return false;
       }
-      return windows::set_virtual_file_clipboard(content.data, content.file_transfer_id, content.origin_id, content.item_id);
+      return windows::set_virtual_file_clipboard(
+        content.file_transfer_id,
+        content.origin_id,
+        content.item_id
+      );
     }
 
     std::vector<std::uint8_t> dibv5;

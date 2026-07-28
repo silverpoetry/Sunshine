@@ -47,6 +47,7 @@ namespace clipboard_file_store {
 
     struct pending_request_t {
       std::string id;
+      request_kind_e kind {request_kind_e::chunk};
       std::uint32_t file_index {};
       std::uint64_t offset {};
       std::size_t length {};
@@ -58,12 +59,14 @@ namespace clipboard_file_store {
     };
 
     struct entry_t {
+      std::vector<fs::path> local_paths;
       std::vector<std::uint8_t> manifest;
       digest_t manifest_sha256 {};
       std::uint64_t origin_id {};
       std::string idempotency_key;
       std::vector<file_t> files;
       bool remote_source {};
+      bool manifest_building {};
       clock_t::time_point expires_at;
       std::deque<std::string> queued_requests;
       std::unordered_map<std::string, std::shared_ptr<pending_request_t>> requests;
@@ -71,6 +74,7 @@ namespace clipboard_file_store {
 
     std::mutex store_mutex;
     std::condition_variable request_available;
+    std::condition_variable manifest_available;
     std::unordered_map<std::string, entry_t> entries;
     std::unordered_map<std::string, std::string> idempotency_entries;
 
@@ -425,6 +429,7 @@ namespace clipboard_file_store {
       cancel_requests_locked(position->second, "source_released");
       entries.erase(position);
       request_available.notify_all();
+      manifest_available.notify_all();
     }
 
     void sweep_locked(clock_t::time_point now) {
@@ -447,7 +452,11 @@ namespace clipboard_file_store {
       return id;
     }
 
-    reference_result_t existing_idempotent_locked(const digest_t &manifest_sha256, std::size_t manifest_size, std::uint64_t origin_id, const std::string &idempotency_key, bool remote_source) {
+    reference_result_t existing_idempotent_locked(
+      std::uint64_t origin_id,
+      const std::string &idempotency_key,
+      bool remote_source
+    ) {
       const auto map_key = idempotency_map_key(origin_id, idempotency_key);
       auto mapped = idempotency_entries.find(map_key);
       if (mapped == idempotency_entries.end()) {
@@ -458,22 +467,19 @@ namespace clipboard_file_store {
         idempotency_entries.erase(mapped);
         return {};
       }
-      if (existing->second.manifest_sha256 != manifest_sha256 ||
-          existing->second.manifest.size() != manifest_size ||
-          existing->second.remote_source != remote_source) {
+      if (existing->second.remote_source != remote_source) {
         return {.error = "idempotency_conflict"};
       }
       existing->second.expires_at = clock_t::now() + std::chrono::seconds(source_ttl_seconds);
       return {
         .ok = true,
         .id = existing->first,
-        .manifest_size = existing->second.manifest.size(),
-        .manifest_sha256 = existing->second.manifest_sha256,
       };
     }
 
     chunk_result_t read_local_chunk(
       const std::string &id,
+      std::uint64_t origin_id,
       std::uint32_t file_index,
       std::uint64_t offset,
       std::size_t length
@@ -486,6 +492,7 @@ namespace clipboard_file_store {
           auto position = entries.find(id);
           if (position == entries.end() ||
               position->second.remote_source ||
+              position->second.origin_id != origin_id ||
               file_index >= position->second.files.size()) {
             return {.error = "not_found"};
           }
@@ -537,38 +544,129 @@ namespace clipboard_file_store {
         return {.error = error.what()};
       }
     }
+
+    struct remote_payload_result_t {
+      bool ok {};
+      std::vector<std::uint8_t> bytes;
+      std::string error;
+    };
+
+    remote_payload_result_t request_remote_payload(
+      const std::string &id,
+      std::uint64_t origin_id,
+      request_kind_e kind,
+      std::uint32_t file_index,
+      std::uint64_t offset,
+      std::size_t length
+    ) {
+      if (kind == request_kind_e::chunk &&
+          (length == 0 || length > max_chunk_bytes)) {
+        return {.error = "bad_chunk_size"};
+      }
+
+      std::shared_ptr<pending_request_t> request;
+      try {
+        std::lock_guard lock(store_mutex);
+        sweep_locked(clock_t::now());
+        auto position = entries.find(id);
+        if (position == entries.end() ||
+            !position->second.remote_source ||
+            position->second.origin_id != origin_id) {
+          return {.error = "not_found"};
+        }
+        auto &entry = position->second;
+        if (kind == request_kind_e::chunk) {
+          if (file_index >= entry.files.size()) {
+            return {.error = "not_found"};
+          }
+          const auto &file = entry.files[file_index];
+          if (file.type != LI_CLIPBOARD_FILE_TYPE_REGULAR ||
+              offset > file.size ||
+              length > file.size - offset) {
+            return {.error = "bad_file_range"};
+          }
+        }
+
+        request = std::make_shared<pending_request_t>();
+        request->id = make_id();
+        request->kind = kind;
+        request->file_index = file_index;
+        request->offset = offset;
+        request->length = length;
+        entry.requests.emplace(request->id, request);
+        entry.queued_requests.push_back(request->id);
+        entry.expires_at =
+          clock_t::now() + std::chrono::seconds(source_ttl_seconds);
+        request_available.notify_all();
+      } catch (const std::exception &error) {
+        return {.error = error.what()};
+      }
+
+      std::unique_lock request_lock(request->mutex);
+      const bool completed = request->ready.wait_for(
+        request_lock,
+        std::chrono::seconds(request_timeout_seconds),
+        [&request]() {
+          return request->complete;
+        }
+      );
+      if (!completed) {
+        request->complete = true;
+        request->error = "request_timeout";
+      }
+      auto bytes = std::move(request->bytes);
+      auto error = std::move(request->error);
+      request_lock.unlock();
+
+      {
+        std::lock_guard lock(store_mutex);
+        auto position = entries.find(id);
+        if (position != entries.end()) {
+          position->second.requests.erase(request->id);
+          auto queued = std::find(
+            position->second.queued_requests.begin(),
+            position->second.queued_requests.end(),
+            request->id
+          );
+          if (queued != position->second.queued_requests.end()) {
+            position->second.queued_requests.erase(queued);
+          }
+        }
+      }
+
+      if (!completed || !error.empty()) {
+        return {.error = error.empty() ? "invalid_response" : std::move(error)};
+      }
+      if ((kind == request_kind_e::manifest &&
+           (bytes.empty() ||
+            bytes.size() > LI_CLIPBOARD_MAX_FILE_MANIFEST_BYTES ||
+            !LiIsValidClipboardFileManifest(bytes.data(), bytes.size()))) ||
+          (kind == request_kind_e::chunk && bytes.size() != length)) {
+        return {.error = "invalid_response"};
+      }
+      return {.ok = true, .bytes = std::move(bytes)};
+    }
   }  // namespace
 
-  reference_result_t register_sources(const std::vector<fs::path> &paths, std::uint64_t origin_id, std::string idempotency_key) {
-    if (origin_id == 0 || idempotency_key.empty() || idempotency_key.size() > 128) {
+  reference_result_t register_local_offer(
+    const std::vector<fs::path> &paths,
+    std::uint64_t origin_id,
+    std::string idempotency_key
+  ) {
+    if (origin_id == 0 ||
+        idempotency_key.empty() ||
+        idempotency_key.size() > 128 ||
+        paths.empty() ||
+        paths.size() > LI_CLIPBOARD_MAX_FILE_ENTRIES) {
       return {.error = "invalid_identity"};
     }
 
     try {
-      std::vector<file_t> files;
-      std::string error;
-      const auto enumerated = with_current_user_file_access([&]() {
-        return enumerate_sources(paths, files, error);
-      });
-      if (!enumerated) {
-        return {.error = "user_file_access_unavailable"};
-      }
-      if (!*enumerated) {
-        return {.error = std::move(error)};
-      }
-
-      std::vector<std::uint8_t> manifest;
-      if (!encode_manifest(files, manifest, error)) {
-        return {.error = std::move(error)};
-      }
-      const auto digest = calculate_sha256(manifest.data(), manifest.size());
       const auto now = clock_t::now();
 
       std::lock_guard lock(store_mutex);
       sweep_locked(now);
       auto existing = existing_idempotent_locked(
-        digest,
-        manifest.size(),
         origin_id,
         idempotency_key,
         false
@@ -579,11 +677,9 @@ namespace clipboard_file_store {
 
       const auto id = unique_id_locked();
       entry_t entry {
-        .manifest = std::move(manifest),
-        .manifest_sha256 = digest,
+        .local_paths = paths,
         .origin_id = origin_id,
         .idempotency_key = idempotency_key,
-        .files = std::move(files),
         .remote_source = false,
         .expires_at = now + std::chrono::seconds(source_ttl_seconds),
       };
@@ -593,37 +689,28 @@ namespace clipboard_file_store {
       return {
         .ok = true,
         .id = id,
-        .manifest_size = entries.at(id).manifest.size(),
-        .manifest_sha256 = digest,
       };
     } catch (const std::exception &error) {
       return {.error = error.what()};
     }
   }
 
-  reference_result_t register_remote_source(std::vector<std::uint8_t> manifest, std::uint64_t origin_id, std::string idempotency_key) {
+  reference_result_t register_remote_offer(
+    std::uint64_t origin_id,
+    std::string idempotency_key
+  ) {
     if (origin_id == 0 ||
         idempotency_key.empty() ||
-        idempotency_key.size() > 128 ||
-        manifest.empty() ||
-        manifest.size() > LI_CLIPBOARD_MAX_FILE_MANIFEST_BYTES) {
-      return {.error = "invalid_identity_or_manifest"};
+        idempotency_key.size() > 128) {
+      return {.error = "invalid_identity"};
     }
 
     try {
-      std::vector<file_t> files;
-      std::string error;
-      if (!decode_manifest(manifest, files, error)) {
-        return {.error = std::move(error)};
-      }
-      const auto digest = calculate_sha256(manifest.data(), manifest.size());
       const auto now = clock_t::now();
 
       std::lock_guard lock(store_mutex);
       sweep_locked(now);
       auto existing = existing_idempotent_locked(
-        digest,
-        manifest.size(),
         origin_id,
         idempotency_key,
         true
@@ -634,11 +721,8 @@ namespace clipboard_file_store {
 
       const auto id = unique_id_locked();
       entry_t entry {
-        .manifest = std::move(manifest),
-        .manifest_sha256 = digest,
         .origin_id = origin_id,
         .idempotency_key = idempotency_key,
-        .files = std::move(files),
         .remote_source = true,
         .expires_at = now + std::chrono::seconds(source_ttl_seconds),
       };
@@ -648,15 +732,16 @@ namespace clipboard_file_store {
       return {
         .ok = true,
         .id = id,
-        .manifest_size = entries.at(id).manifest.size(),
-        .manifest_sha256 = digest,
       };
     } catch (const std::exception &error) {
       return {.error = error.what()};
     }
   }
 
-  source_result_t resolve_remote_source(const std::string &id, std::uint64_t origin_id, std::size_t manifest_size, const digest_t &manifest_sha256) {
+  operation_result_t resolve_remote_offer(
+    const std::string &id,
+    std::uint64_t origin_id
+  ) {
     std::lock_guard lock(store_mutex);
     sweep_locked(clock_t::now());
     auto position = entries.find(id);
@@ -665,13 +750,11 @@ namespace clipboard_file_store {
     }
     auto &entry = position->second;
     if (!entry.remote_source ||
-        entry.origin_id != origin_id ||
-        entry.manifest.size() != manifest_size ||
-        entry.manifest_sha256 != manifest_sha256) {
+        entry.origin_id != origin_id) {
       return {.error = "reference_mismatch"};
     }
     entry.expires_at = clock_t::now() + std::chrono::seconds(source_ttl_seconds);
-    return {.ok = true, .manifest = entry.manifest};
+    return {.ok = true};
   }
 
   request_result_t poll_remote_request(const std::string &id, std::uint64_t origin_id, int timeout_seconds) {
@@ -720,6 +803,7 @@ namespace clipboard_file_store {
     return {
       .found = true,
       .request_id = request_id,
+      .kind = request->kind,
       .file_index = request->file_index,
       .offset = request->offset,
       .length = request->length,
@@ -746,7 +830,13 @@ namespace clipboard_file_store {
         clock_t::now() + std::chrono::seconds(source_ttl_seconds);
     }
 
-    if (bytes.size() != request->length) {
+    if (request->kind == request_kind_e::manifest) {
+      if (bytes.empty() ||
+          bytes.size() > LI_CLIPBOARD_MAX_FILE_MANIFEST_BYTES ||
+          !LiIsValidClipboardFileManifest(bytes.data(), bytes.size())) {
+        return {.error = "invalid_manifest"};
+      }
+    } else if (bytes.size() != request->length) {
       return {.error = "wrong_chunk_size"};
     }
     try {
@@ -820,109 +910,193 @@ namespace clipboard_file_store {
     return {.ok = true};
   }
 
-  chunk_result_t request_remote_chunk(const std::string &id, std::uint64_t origin_id, std::uint32_t file_index, std::uint64_t offset, std::size_t length) {
-    if (length == 0 || length > max_chunk_bytes) {
-      return {.error = "bad_chunk_size"};
-    }
-
-    std::shared_ptr<pending_request_t> request;
-    try {
-      std::lock_guard lock(store_mutex);
-      sweep_locked(clock_t::now());
-      auto position = entries.find(id);
-      if (position == entries.end() ||
-          !position->second.remote_source ||
-          position->second.origin_id != origin_id ||
-          file_index >= position->second.files.size()) {
-        return {.error = "not_found"};
-      }
-      auto &entry = position->second;
-      const auto &file = entry.files[file_index];
-      if (file.type != LI_CLIPBOARD_FILE_TYPE_REGULAR ||
-          offset > file.size ||
-          length > file.size - offset) {
-        return {.error = "bad_file_range"};
-      }
-
-      request = std::make_shared<pending_request_t>();
-      request->id = make_id();
-      request->file_index = file_index;
-      request->offset = offset;
-      request->length = length;
-      entry.requests.emplace(request->id, request);
-      entry.queued_requests.push_back(request->id);
-      entry.expires_at = clock_t::now() + std::chrono::seconds(source_ttl_seconds);
-      request_available.notify_all();
-    } catch (const std::exception &error) {
-      return {.error = error.what()};
-    }
-
-    std::unique_lock request_lock(request->mutex);
-    const bool completed = request->ready.wait_for(
-      request_lock,
-      std::chrono::seconds(request_timeout_seconds),
-      [&request]() {
-        return request->complete;
-      }
+  static chunk_result_t request_remote_chunk(const std::string &id, std::uint64_t origin_id, std::uint32_t file_index, std::uint64_t offset, std::size_t length) {
+    auto payload = request_remote_payload(
+      id,
+      origin_id,
+      request_kind_e::chunk,
+      file_index,
+      offset,
+      length
     );
-    if (!completed) {
-      request->complete = true;
-      request->error = "request_timeout";
-    }
-    auto bytes = std::move(request->bytes);
-    auto error = std::move(request->error);
-    request_lock.unlock();
-
-    {
-      std::lock_guard lock(store_mutex);
-      auto position = entries.find(id);
-      if (position != entries.end()) {
-        position->second.requests.erase(request->id);
-        auto queued = std::find(position->second.queued_requests.begin(), position->second.queued_requests.end(), request->id);
-        if (queued != position->second.queued_requests.end()) {
-          position->second.queued_requests.erase(queued);
-        }
-      }
-    }
-
-    if (!completed || !error.empty() || bytes.size() != length) {
-      return {.error = error.empty() ? "invalid_response" : std::move(error)};
+    if (!payload.ok) {
+      return {.error = std::move(payload.error)};
     }
     try {
       return {
         .ok = true,
-        .bytes = bytes,
-        .sha256 = calculate_sha256(bytes.data(), bytes.size()),
+        .bytes = payload.bytes,
+        .sha256 = calculate_sha256(
+          payload.bytes.data(),
+          payload.bytes.size()
+        ),
       };
     } catch (const std::exception &exception) {
       return {.error = exception.what()};
     }
   }
 
-  manifest_result_t get_manifest(const std::string &id) {
-    std::lock_guard lock(store_mutex);
-    sweep_locked(clock_t::now());
-    auto position = entries.find(id);
-    if (position == entries.end() || position->second.remote_source) {
-      return {};
+  manifest_result_t get_manifest(
+    const std::string &id,
+    std::uint64_t requesting_origin_id
+  ) {
+    std::vector<fs::path> local_paths;
+    std::uint64_t origin_id = 0;
+    bool remote_source = false;
+    {
+      std::unique_lock lock(store_mutex);
+      for (;;) {
+        sweep_locked(clock_t::now());
+        auto position = entries.find(id);
+        if (position == entries.end() ||
+            position->second.origin_id != requesting_origin_id) {
+          return {.error = "not_found"};
+        }
+        auto &entry = position->second;
+        entry.expires_at =
+          clock_t::now() + std::chrono::seconds(source_ttl_seconds);
+        if (!entry.manifest.empty()) {
+          return {
+            .ok = true,
+            .bytes = entry.manifest,
+            .sha256 = entry.manifest_sha256,
+            .origin_id = entry.origin_id,
+          };
+        }
+        if (!entry.manifest_building) {
+          entry.manifest_building = true;
+          local_paths = entry.local_paths;
+          origin_id = entry.origin_id;
+          remote_source = entry.remote_source;
+          break;
+        }
+        manifest_available.wait(lock, [&]() {
+          auto current = entries.find(id);
+          return current == entries.end() ||
+                 !current->second.manifest_building;
+        });
+      }
     }
-    position->second.expires_at =
-      clock_t::now() + std::chrono::seconds(source_ttl_seconds);
+
+    std::vector<file_t> files;
+    std::vector<std::uint8_t> manifest;
+    std::string error;
+    if (remote_source) {
+      auto payload = request_remote_payload(
+        id,
+        origin_id,
+        request_kind_e::manifest,
+        0,
+        0,
+        0
+      );
+      if (!payload.ok) {
+        error = std::move(payload.error);
+      } else {
+        manifest = std::move(payload.bytes);
+        if (!decode_manifest(manifest, files, error)) {
+          manifest.clear();
+        }
+      }
+    } else {
+      const auto enumerated = with_current_user_file_access([&]() {
+        return enumerate_sources(local_paths, files, error);
+      });
+      if (!enumerated) {
+        error = "user_file_access_unavailable";
+      } else if (*enumerated &&
+                 !encode_manifest(files, manifest, error)) {
+        manifest.clear();
+      }
+    }
+
+    digest_t digest {};
+    if (!manifest.empty()) {
+      try {
+        digest = calculate_sha256(manifest.data(), manifest.size());
+      } catch (const std::exception &exception) {
+        error = exception.what();
+        manifest.clear();
+      }
+    }
+    if (manifest.empty() && error.empty()) {
+      error = "manifest_unavailable";
+    }
+
+    {
+      std::lock_guard lock(store_mutex);
+      auto position = entries.find(id);
+      if (position == entries.end() ||
+          position->second.origin_id != requesting_origin_id) {
+        manifest_available.notify_all();
+        return {.error = "not_found"};
+      }
+      auto &entry = position->second;
+      if (!manifest.empty()) {
+        entry.manifest = manifest;
+        entry.manifest_sha256 = digest;
+        entry.files = std::move(files);
+      }
+      entry.manifest_building = false;
+      entry.expires_at =
+        clock_t::now() + std::chrono::seconds(source_ttl_seconds);
+      manifest_available.notify_all();
+    }
+
+    if (manifest.empty()) {
+      return {.error = std::move(error)};
+    }
     return {
-      .found = true,
-      .bytes = position->second.manifest,
-      .sha256 = position->second.manifest_sha256,
-      .origin_id = position->second.origin_id,
+      .ok = true,
+      .bytes = std::move(manifest),
+      .sha256 = digest,
+      .origin_id = origin_id,
     };
   }
 
-  chunk_result_t read_chunk(const std::string &id, std::uint32_t file_index, std::uint64_t offset, std::size_t length) {
+  chunk_result_t read_chunk(
+    const std::string &id,
+    std::uint64_t requesting_origin_id,
+    std::uint32_t file_index,
+    std::uint64_t offset,
+    std::size_t length
+  ) {
     if (length == 0 || length > max_chunk_bytes) {
       return {.error = "bad_chunk_size"};
     }
 
+    std::uint64_t origin_id = 0;
+    bool remote_source = false;
+    {
+      std::lock_guard lock(store_mutex);
+      sweep_locked(clock_t::now());
+      auto position = entries.find(id);
+      if (position == entries.end() ||
+          position->second.origin_id != requesting_origin_id ||
+          position->second.manifest.empty()) {
+        return {.error = "not_found"};
+      }
+      remote_source = position->second.remote_source;
+      origin_id = position->second.origin_id;
+    }
+    if (remote_source) {
+      return request_remote_chunk(
+        id,
+        origin_id,
+        file_index,
+        offset,
+        length
+      );
+    }
+
     auto result = with_current_user_file_access([&]() {
-      return read_local_chunk(id, file_index, offset, length);
+      return read_local_chunk(
+        id,
+        requesting_origin_id,
+        file_index,
+        offset,
+        length
+      );
     });
     if (!result) {
       return {.error = "user_file_access_unavailable"};

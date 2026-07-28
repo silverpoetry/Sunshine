@@ -1326,19 +1326,17 @@ namespace nvhttp {
     void register_clipboard_file_source(resp_https_t response, req_https_t request) {
       std::uint64_t origin_id {};
       std::string idempotency_key;
-      std::vector<std::uint8_t> manifest;
       if (!validate_clipboard_origin(request, origin_id, true)) {
         write_clipboard_json(response, SimpleWeb::StatusCode::client_error_forbidden, R"({"error":"inactive_clipboard_session"})");
         return;
       }
       if (!valid_clipboard_idempotency_key(request, idempotency_key) ||
-          !read_bounded_body(request, LI_CLIPBOARD_MAX_FILE_MANIFEST_BYTES, manifest)) {
-        write_clipboard_json(response, SimpleWeb::StatusCode::client_error_bad_request, R"({"error":"invalid_manifest_request"})");
+          request->content.size() != 0) {
+        write_clipboard_json(response, SimpleWeb::StatusCode::client_error_bad_request, R"({"error":"invalid_offer_request"})");
         return;
       }
 
-      auto result = clipboard_file_store::register_remote_source(
-        std::move(manifest),
+      auto result = clipboard_file_store::register_remote_offer(
         origin_id,
         std::move(idempotency_key)
       );
@@ -1349,9 +1347,8 @@ namespace nvhttp {
       BOOST_LOG(debug)
         << "Clipboard file trace transfer="
         << result.id
-        << " phase=registered manifest_bytes="
-        << result.manifest_size;
-      write_clipboard_json(response, SimpleWeb::StatusCode::success_ok, std::format(R"({{"id":"{}","size":{},"sha256":"{}","expires_in":{}}})", result.id, result.manifest_size, digest_hex(result.manifest_sha256), clipboard_file_store::source_ttl_seconds));
+        << " phase=offer_registered";
+      write_clipboard_json(response, SimpleWeb::StatusCode::success_ok, std::format(R"({{"id":"{}","expires_in":{}}})", result.id, clipboard_file_store::source_ttl_seconds));
     }
 
     void pull_clipboard_file_source(resp_https_t response, req_https_t request) {
@@ -1363,7 +1360,7 @@ namespace nvhttp {
 
       platf::clipboard_content_t content;
       if (!platf::get_clipboard_content(LI_CLIPBOARD_CAP_FILES, content) ||
-          content.mime_type != LI_CLIPBOARD_MIME_FILE_MANIFEST ||
+          content.mime_type != LI_CLIPBOARD_MIME_FILE_OFFER ||
           content.paths.empty()) {
         BOOST_LOG(info)
           << "Clipboard file pull found no files (sequence "
@@ -1373,17 +1370,15 @@ namespace nvhttp {
         return;
       }
 
-      auto result = clipboard_file_store::register_sources(
+      auto result = clipboard_file_store::register_local_offer(
         content.paths,
         origin_id,
         "pull:" + uuid_util::uuid_t::generate().string()
       );
-      if (!result.ok ||
-          result.manifest_size == 0 ||
-          result.manifest_size > UINT32_MAX) {
+      if (!result.ok) {
         BOOST_LOG(warning)
           << "Clipboard file pull registration failed: "
-          << (result.error.empty() ? "invalid manifest size" : result.error);
+          << result.error;
         write_clipboard_json(
           response,
           SimpleWeb::StatusCode::client_error_conflict,
@@ -1400,10 +1395,8 @@ namespace nvhttp {
         response,
         SimpleWeb::StatusCode::success_ok,
         std::format(
-          R"({{"id":"{}","size":{},"sha256":"{}","expires_in":{}}})",
+          R"({{"id":"{}","expires_in":{}}})",
           result.id,
-          result.manifest_size,
-          digest_hex(result.manifest_sha256),
           clipboard_file_store::source_ttl_seconds
         )
       );
@@ -1466,8 +1459,11 @@ namespace nvhttp {
             response,
             SimpleWeb::StatusCode::success_ok,
             std::format(
-              R"({{"request":{{"id":"{}","file_index":{},"offset":{},"length":{}}}}})",
+              R"({{"request":{{"id":"{}","type":"{}","file_index":{},"offset":{},"length":{}}}}})",
               result.request_id,
+              result.kind == clipboard_file_store::request_kind_e::manifest ?
+                "manifest" :
+                "chunk",
               result.file_index,
               result.offset,
               result.length
@@ -1602,10 +1598,17 @@ namespace nvhttp {
       (void) origin_id;
 
       auto result = clipboard_file_store::get_manifest(
-        request->path_match.size() >= 2 ? request->path_match[1].str() : std::string {}
+        request->path_match.size() >= 2 ? request->path_match[1].str() : std::string {},
+        origin_id
       );
-      if (!result.found) {
-        write_clipboard_json(response, SimpleWeb::StatusCode::client_error_not_found, R"({"error":"not_found"})");
+      if (!result.ok) {
+        write_clipboard_json(
+          response,
+          result.error == "not_found" ?
+            SimpleWeb::StatusCode::client_error_not_found :
+            SimpleWeb::StatusCode::client_error_conflict,
+          std::format(R"({{"error":"{}"}})", result.error)
+        );
         return;
       }
 
@@ -1648,6 +1651,7 @@ namespace nvhttp {
 
       auto result = clipboard_file_store::read_chunk(
         request->path_match[1].str(),
+        origin_id,
         static_cast<std::uint32_t>(file_index_u64),
         offset,
         static_cast<std::size_t>(length)
@@ -1847,6 +1851,10 @@ namespace nvhttp {
     // Keep them off the HTTPS I/O context so they cannot block registration,
     // pairing, or other management requests.
     thread_pool_util::ThreadPool clipboard_poll_workers {4};
+    // Manifest discovery and remote chunk reads may perform filesystem I/O or
+    // wait for the peer. Keep them separate from both HTTPS I/O and long polls
+    // so a full set of poll requests cannot deadlock an on-demand file read.
+    thread_pool_util::ThreadPool clipboard_file_workers {4};
 
     // Verify certificates after establishing connection
     https_server.verify = [add_cert](SSL *ssl) {
@@ -1945,8 +1953,34 @@ namespace nvhttp {
       };
     https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/requests/([0-9a-f\\-]{36})$"]["POST"] = fulfill_clipboard_file_request;
     https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/release$"]["POST"] = release_clipboard_file_source;
-    https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/manifest$"]["GET"] = download_clipboard_file_manifest;
-    https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/([0-9]+)$"]["GET"] = download_clipboard_file_chunk;
+    https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/manifest$"]["GET"] =
+      [&clipboard_file_workers](auto response, auto request) {
+        clipboard_file_workers.push(
+          [
+            response = std::move(response),
+            request = std::move(request)
+          ]() {
+            download_clipboard_file_manifest(
+              std::move(response),
+              std::move(request)
+            );
+          }
+        );
+      };
+    https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/([0-9]+)$"]["GET"] =
+      [&clipboard_file_workers](auto response, auto request) {
+        clipboard_file_workers.push(
+          [
+            response = std::move(response),
+            request = std::move(request)
+          ]() {
+            download_clipboard_file_chunk(
+              std::move(response),
+              std::move(request)
+            );
+          }
+        );
+      };
     https_server.resource["^/api/files/desktop$"]["POST"] = begin_desktop_file_transfer;
     https_server.resource["^/api/files/desktop/([0-9a-f\\-]{36})/([0-9]+)$"]["PUT"] = upload_desktop_file_chunk;
     https_server.resource["^/api/files/desktop/([0-9a-f\\-]{36})/complete$"]["POST"] = complete_desktop_file_transfer;
@@ -1991,10 +2025,12 @@ namespace nvhttp {
     http_server.stop();
     clipboard_file_store::release_all_remote_sources();
     clipboard_poll_workers.stop();
+    clipboard_file_workers.stop();
 
     ssl.join();
     tcp.join();
     clipboard_poll_workers.join();
+    clipboard_file_workers.join();
   }
 
   void erase_all_clients() {
