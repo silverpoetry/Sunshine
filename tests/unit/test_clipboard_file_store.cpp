@@ -99,14 +99,18 @@ TEST_F(ClipboardFileStoreTest, TransfersManifestAndChunksOnDemand) {
   constexpr std::uint64_t client_origin = 22;
   auto local = clipboard_file_store::register_local_offer(
     {source_root / "folder"},
-    host_origin,
+    client_origin,
     "local"
   );
   ASSERT_TRUE(local.ok) << local.error;
 
-  auto local_manifest = clipboard_file_store::get_manifest(
+  EXPECT_FALSE(clipboard_file_store::get_manifest(
     local.id,
     host_origin
+  ).ok);
+  auto local_manifest = clipboard_file_store::get_manifest(
+    local.id,
+    client_origin
   );
   ASSERT_TRUE(local_manifest.ok) << local_manifest.error;
   ASSERT_TRUE(LiIsValidClipboardFileManifest(
@@ -194,7 +198,7 @@ TEST_F(ClipboardFileStoreTest, TransfersManifestAndChunksOnDemand) {
 
   auto source_chunk = clipboard_file_store::read_chunk(
     local.id,
-    host_origin,
+    client_origin,
     file.index,
     chunk_request.offset,
     chunk_request.length
@@ -220,6 +224,29 @@ TEST_F(ClipboardFileStoreTest, TransfersManifestAndChunksOnDemand) {
     std::string(received.bytes.begin(), received.bytes.end()),
     "hello"
   );
+}
+
+TEST_F(ClipboardFileStoreTest, ReleasesLocalOfferWithAuthorizedClient) {
+  constexpr std::uint64_t host_origin = 51;
+  constexpr std::uint64_t client_origin = 52;
+  auto local = clipboard_file_store::register_local_offer(
+    {source_root / "folder"},
+    client_origin,
+    "client-bound"
+  );
+  ASSERT_TRUE(local.ok) << local.error;
+
+  clipboard_file_store::release_origin(host_origin);
+  EXPECT_TRUE(clipboard_file_store::get_manifest(
+    local.id,
+    client_origin
+  ).ok);
+
+  clipboard_file_store::release_origin(client_origin);
+  EXPECT_FALSE(clipboard_file_store::get_manifest(
+    local.id,
+    client_origin
+  ).ok);
 }
 
 TEST_F(ClipboardFileStoreTest, RejectsWrongOriginAndUnsolicitedResponses) {

@@ -1597,11 +1597,20 @@ namespace nvhttp {
       }
       (void) origin_id;
 
+      const auto transfer_id =
+        request->path_match.size() >= 2 ?
+          request->path_match[1].str() :
+          std::string {};
       auto result = clipboard_file_store::get_manifest(
-        request->path_match.size() >= 2 ? request->path_match[1].str() : std::string {},
+        transfer_id,
         origin_id
       );
       if (!result.ok) {
+        BOOST_LOG(warning)
+          << "Clipboard file manifest request failed for transfer "
+          << transfer_id
+          << ": "
+          << result.error;
         write_clipboard_json(
           response,
           result.error == "not_found" ?
@@ -1657,6 +1666,11 @@ namespace nvhttp {
         static_cast<std::size_t>(length)
       );
       if (!result.ok) {
+        BOOST_LOG(warning)
+          << "Clipboard file chunk request failed for transfer "
+          << request->path_match[1].str()
+          << ": "
+          << result.error;
         write_clipboard_json(response, result.error == "not_found" ? SimpleWeb::StatusCode::client_error_not_found : SimpleWeb::StatusCode::client_error_conflict, std::format(R"({{"error":"{}"}})", result.error));
         return;
       }

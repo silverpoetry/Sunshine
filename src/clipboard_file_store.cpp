@@ -62,7 +62,7 @@ namespace clipboard_file_store {
       std::vector<fs::path> local_paths;
       std::vector<std::uint8_t> manifest;
       digest_t manifest_sha256 {};
-      std::uint64_t origin_id {};
+      std::uint64_t authorized_origin_id {};
       std::string idempotency_key;
       std::vector<file_t> files;
       bool remote_source {};
@@ -151,8 +151,11 @@ namespace clipboard_file_store {
       return std::invoke(std::forward<Function>(function));
     }
 
-    std::string idempotency_map_key(std::uint64_t origin_id, const std::string &key) {
-      return std::to_string(origin_id) + ':' + key;
+    std::string idempotency_map_key(
+      std::uint64_t authorized_origin_id,
+      const std::string &key
+    ) {
+      return std::to_string(authorized_origin_id) + ':' + key;
     }
 
     digest_t calculate_sha256(const void *data, std::size_t size) {
@@ -423,7 +426,10 @@ namespace clipboard_file_store {
       }
       if (!position->second.idempotency_key.empty()) {
         idempotency_entries.erase(
-          idempotency_map_key(position->second.origin_id, position->second.idempotency_key)
+          idempotency_map_key(
+            position->second.authorized_origin_id,
+            position->second.idempotency_key
+          )
         );
       }
       cancel_requests_locked(position->second, "source_released");
@@ -453,11 +459,12 @@ namespace clipboard_file_store {
     }
 
     reference_result_t existing_idempotent_locked(
-      std::uint64_t origin_id,
+      std::uint64_t authorized_origin_id,
       const std::string &idempotency_key,
       bool remote_source
     ) {
-      const auto map_key = idempotency_map_key(origin_id, idempotency_key);
+      const auto map_key =
+        idempotency_map_key(authorized_origin_id, idempotency_key);
       auto mapped = idempotency_entries.find(map_key);
       if (mapped == idempotency_entries.end()) {
         return {};
@@ -479,7 +486,7 @@ namespace clipboard_file_store {
 
     chunk_result_t read_local_chunk(
       const std::string &id,
-      std::uint64_t origin_id,
+      std::uint64_t authorized_origin_id,
       std::uint32_t file_index,
       std::uint64_t offset,
       std::size_t length
@@ -492,7 +499,8 @@ namespace clipboard_file_store {
           auto position = entries.find(id);
           if (position == entries.end() ||
               position->second.remote_source ||
-              position->second.origin_id != origin_id ||
+              position->second.authorized_origin_id !=
+                authorized_origin_id ||
               file_index >= position->second.files.size()) {
             return {.error = "not_found"};
           }
@@ -553,7 +561,7 @@ namespace clipboard_file_store {
 
     remote_payload_result_t request_remote_payload(
       const std::string &id,
-      std::uint64_t origin_id,
+      std::uint64_t authorized_origin_id,
       request_kind_e kind,
       std::uint32_t file_index,
       std::uint64_t offset,
@@ -571,7 +579,8 @@ namespace clipboard_file_store {
         auto position = entries.find(id);
         if (position == entries.end() ||
             !position->second.remote_source ||
-            position->second.origin_id != origin_id) {
+            position->second.authorized_origin_id !=
+              authorized_origin_id) {
           return {.error = "not_found"};
         }
         auto &entry = position->second;
@@ -650,10 +659,10 @@ namespace clipboard_file_store {
 
   reference_result_t register_local_offer(
     const std::vector<fs::path> &paths,
-    std::uint64_t origin_id,
+    std::uint64_t authorized_origin_id,
     std::string idempotency_key
   ) {
-    if (origin_id == 0 ||
+    if (authorized_origin_id == 0 ||
         idempotency_key.empty() ||
         idempotency_key.size() > 128 ||
         paths.empty() ||
@@ -667,7 +676,7 @@ namespace clipboard_file_store {
       std::lock_guard lock(store_mutex);
       sweep_locked(now);
       auto existing = existing_idempotent_locked(
-        origin_id,
+        authorized_origin_id,
         idempotency_key,
         false
       );
@@ -678,12 +687,13 @@ namespace clipboard_file_store {
       const auto id = unique_id_locked();
       entry_t entry {
         .local_paths = paths,
-        .origin_id = origin_id,
+        .authorized_origin_id = authorized_origin_id,
         .idempotency_key = idempotency_key,
         .remote_source = false,
         .expires_at = now + std::chrono::seconds(source_ttl_seconds),
       };
-      const auto map_key = idempotency_map_key(origin_id, idempotency_key);
+      const auto map_key =
+        idempotency_map_key(authorized_origin_id, idempotency_key);
       entries.emplace(id, std::move(entry));
       idempotency_entries[map_key] = id;
       return {
@@ -696,10 +706,10 @@ namespace clipboard_file_store {
   }
 
   reference_result_t register_remote_offer(
-    std::uint64_t origin_id,
+    std::uint64_t authorized_origin_id,
     std::string idempotency_key
   ) {
-    if (origin_id == 0 ||
+    if (authorized_origin_id == 0 ||
         idempotency_key.empty() ||
         idempotency_key.size() > 128) {
       return {.error = "invalid_identity"};
@@ -711,7 +721,7 @@ namespace clipboard_file_store {
       std::lock_guard lock(store_mutex);
       sweep_locked(now);
       auto existing = existing_idempotent_locked(
-        origin_id,
+        authorized_origin_id,
         idempotency_key,
         true
       );
@@ -721,12 +731,13 @@ namespace clipboard_file_store {
 
       const auto id = unique_id_locked();
       entry_t entry {
-        .origin_id = origin_id,
+        .authorized_origin_id = authorized_origin_id,
         .idempotency_key = idempotency_key,
         .remote_source = true,
         .expires_at = now + std::chrono::seconds(source_ttl_seconds),
       };
-      const auto map_key = idempotency_map_key(origin_id, idempotency_key);
+      const auto map_key =
+        idempotency_map_key(authorized_origin_id, idempotency_key);
       entries.emplace(id, std::move(entry));
       idempotency_entries[map_key] = id;
       return {
@@ -740,7 +751,7 @@ namespace clipboard_file_store {
 
   operation_result_t resolve_remote_offer(
     const std::string &id,
-    std::uint64_t origin_id
+    std::uint64_t authorized_origin_id
   ) {
     std::lock_guard lock(store_mutex);
     sweep_locked(clock_t::now());
@@ -750,14 +761,18 @@ namespace clipboard_file_store {
     }
     auto &entry = position->second;
     if (!entry.remote_source ||
-        entry.origin_id != origin_id) {
+        entry.authorized_origin_id != authorized_origin_id) {
       return {.error = "reference_mismatch"};
     }
     entry.expires_at = clock_t::now() + std::chrono::seconds(source_ttl_seconds);
     return {.ok = true};
   }
 
-  request_result_t poll_remote_request(const std::string &id, std::uint64_t origin_id, int timeout_seconds) {
+  request_result_t poll_remote_request(
+    const std::string &id,
+    std::uint64_t authorized_origin_id,
+    int timeout_seconds
+  ) {
     if (timeout_seconds < 0 || timeout_seconds > poll_timeout_seconds) {
       return {.error = "bad_timeout"};
     }
@@ -768,7 +783,8 @@ namespace clipboard_file_store {
       auto position = entries.find(id);
       return position != entries.end() &&
              position->second.remote_source &&
-             position->second.origin_id == origin_id;
+             position->second.authorized_origin_id ==
+               authorized_origin_id;
     };
     if (!valid_source()) {
       return {.error = "not_found"};
@@ -778,7 +794,8 @@ namespace clipboard_file_store {
       auto position = entries.find(id);
       return position == entries.end() ||
              !position->second.remote_source ||
-             position->second.origin_id != origin_id ||
+             position->second.authorized_origin_id !=
+               authorized_origin_id ||
              !position->second.queued_requests.empty();
     };
     if (!request_available.wait_for(
@@ -810,7 +827,13 @@ namespace clipboard_file_store {
     };
   }
 
-  operation_result_t fulfill_remote_request(const std::string &id, std::uint64_t origin_id, const std::string &request_id, const std::vector<std::uint8_t> &bytes, const digest_t &expected_sha256) {
+  operation_result_t fulfill_remote_request(
+    const std::string &id,
+    std::uint64_t authorized_origin_id,
+    const std::string &request_id,
+    const std::vector<std::uint8_t> &bytes,
+    const digest_t &expected_sha256
+  ) {
     std::shared_ptr<pending_request_t> request;
     {
       std::lock_guard lock(store_mutex);
@@ -818,7 +841,8 @@ namespace clipboard_file_store {
       auto position = entries.find(id);
       if (position == entries.end() ||
           !position->second.remote_source ||
-          position->second.origin_id != origin_id) {
+          position->second.authorized_origin_id !=
+            authorized_origin_id) {
         return {.error = "not_found"};
       }
       auto request_position = position->second.requests.find(request_id);
@@ -857,7 +881,12 @@ namespace clipboard_file_store {
     return {.ok = true};
   }
 
-  operation_result_t fail_remote_request(const std::string &id, std::uint64_t origin_id, const std::string &request_id, std::string error) {
+  operation_result_t fail_remote_request(
+    const std::string &id,
+    std::uint64_t authorized_origin_id,
+    const std::string &request_id,
+    std::string error
+  ) {
     if (error.empty()) {
       return {.error = "missing_error"};
     }
@@ -869,7 +898,8 @@ namespace clipboard_file_store {
       auto position = entries.find(id);
       if (position == entries.end() ||
           !position->second.remote_source ||
-          position->second.origin_id != origin_id) {
+          position->second.authorized_origin_id !=
+            authorized_origin_id) {
         return {.error = "not_found"};
       }
       auto request_position = position->second.requests.find(request_id);
@@ -891,8 +921,11 @@ namespace clipboard_file_store {
     return {.ok = true};
   }
 
-  operation_result_t release_remote_source(const std::string &id, std::uint64_t origin_id) {
-    if (id.empty() || origin_id == 0) {
+  operation_result_t release_remote_source(
+    const std::string &id,
+    std::uint64_t authorized_origin_id
+  ) {
+    if (id.empty() || authorized_origin_id == 0) {
       return {.error = "invalid_identity"};
     }
 
@@ -903,17 +936,24 @@ namespace clipboard_file_store {
       return {.ok = true};
     }
     if (!position->second.remote_source ||
-        position->second.origin_id != origin_id) {
+        position->second.authorized_origin_id !=
+          authorized_origin_id) {
       return {.error = "not_found"};
     }
     erase_entry_locked(id);
     return {.ok = true};
   }
 
-  static chunk_result_t request_remote_chunk(const std::string &id, std::uint64_t origin_id, std::uint32_t file_index, std::uint64_t offset, std::size_t length) {
+  static chunk_result_t request_remote_chunk(
+    const std::string &id,
+    std::uint64_t authorized_origin_id,
+    std::uint32_t file_index,
+    std::uint64_t offset,
+    std::size_t length
+  ) {
     auto payload = request_remote_payload(
       id,
-      origin_id,
+      authorized_origin_id,
       request_kind_e::chunk,
       file_index,
       offset,
@@ -938,10 +978,9 @@ namespace clipboard_file_store {
 
   manifest_result_t get_manifest(
     const std::string &id,
-    std::uint64_t requesting_origin_id
+    std::uint64_t authorized_origin_id
   ) {
     std::vector<fs::path> local_paths;
-    std::uint64_t origin_id = 0;
     bool remote_source = false;
     {
       std::unique_lock lock(store_mutex);
@@ -949,7 +988,8 @@ namespace clipboard_file_store {
         sweep_locked(clock_t::now());
         auto position = entries.find(id);
         if (position == entries.end() ||
-            position->second.origin_id != requesting_origin_id) {
+            position->second.authorized_origin_id !=
+              authorized_origin_id) {
           return {.error = "not_found"};
         }
         auto &entry = position->second;
@@ -960,13 +1000,11 @@ namespace clipboard_file_store {
             .ok = true,
             .bytes = entry.manifest,
             .sha256 = entry.manifest_sha256,
-            .origin_id = entry.origin_id,
           };
         }
         if (!entry.manifest_building) {
           entry.manifest_building = true;
           local_paths = entry.local_paths;
-          origin_id = entry.origin_id;
           remote_source = entry.remote_source;
           break;
         }
@@ -984,7 +1022,7 @@ namespace clipboard_file_store {
     if (remote_source) {
       auto payload = request_remote_payload(
         id,
-        origin_id,
+        authorized_origin_id,
         request_kind_e::manifest,
         0,
         0,
@@ -1027,7 +1065,8 @@ namespace clipboard_file_store {
       std::lock_guard lock(store_mutex);
       auto position = entries.find(id);
       if (position == entries.end() ||
-          position->second.origin_id != requesting_origin_id) {
+          position->second.authorized_origin_id !=
+            authorized_origin_id) {
         manifest_available.notify_all();
         return {.error = "not_found"};
       }
@@ -1050,13 +1089,12 @@ namespace clipboard_file_store {
       .ok = true,
       .bytes = std::move(manifest),
       .sha256 = digest,
-      .origin_id = origin_id,
     };
   }
 
   chunk_result_t read_chunk(
     const std::string &id,
-    std::uint64_t requesting_origin_id,
+    std::uint64_t authorized_origin_id,
     std::uint32_t file_index,
     std::uint64_t offset,
     std::size_t length
@@ -1065,24 +1103,23 @@ namespace clipboard_file_store {
       return {.error = "bad_chunk_size"};
     }
 
-    std::uint64_t origin_id = 0;
     bool remote_source = false;
     {
       std::lock_guard lock(store_mutex);
       sweep_locked(clock_t::now());
       auto position = entries.find(id);
       if (position == entries.end() ||
-          position->second.origin_id != requesting_origin_id ||
+          position->second.authorized_origin_id !=
+            authorized_origin_id ||
           position->second.manifest.empty()) {
         return {.error = "not_found"};
       }
       remote_source = position->second.remote_source;
-      origin_id = position->second.origin_id;
     }
     if (remote_source) {
       return request_remote_chunk(
         id,
-        origin_id,
+        authorized_origin_id,
         file_index,
         offset,
         length
@@ -1092,7 +1129,7 @@ namespace clipboard_file_store {
     auto result = with_current_user_file_access([&]() {
       return read_local_chunk(
         id,
-        requesting_origin_id,
+        authorized_origin_id,
         file_index,
         offset,
         length
@@ -1109,13 +1146,14 @@ namespace clipboard_file_store {
     sweep_locked(clock_t::now());
   }
 
-  void release_origin(std::uint64_t origin_id) {
-    if (origin_id == 0) {
+  void release_origin(std::uint64_t authorized_origin_id) {
+    if (authorized_origin_id == 0) {
       return;
     }
     std::lock_guard lock(store_mutex);
     for (auto position = entries.begin(); position != entries.end();) {
-      if (position->second.origin_id != origin_id) {
+      if (position->second.authorized_origin_id !=
+          authorized_origin_id) {
         ++position;
         continue;
       }

@@ -112,21 +112,33 @@ namespace stream {
     }
 
     void register_clipboard_origin(std::uint64_t origin_id, std::uint8_t capabilities) {
-      if (origin_id == 0 || (capabilities & LI_CLIPBOARD_CAP_BLOB) == 0) {
+      const bool supports_blobs =
+        (capabilities & LI_CLIPBOARD_CAP_BLOB) != 0;
+      const bool supports_files =
+        (capabilities &
+         (LI_CLIPBOARD_CAP_FILES | LI_CLIPBOARD_CAP_FILE_STREAMS)) ==
+          (LI_CLIPBOARD_CAP_FILES | LI_CLIPBOARD_CAP_FILE_STREAMS);
+      if (origin_id == 0 || (!supports_blobs && !supports_files)) {
         return;
       }
       std::lock_guard lock(clipboard_origins_mutex);
       auto &state = clipboard_active_origins[origin_id];
-      ++state.blob_sessions;
-      if ((capabilities &
-           (LI_CLIPBOARD_CAP_FILES | LI_CLIPBOARD_CAP_FILE_STREAMS)) ==
-          (LI_CLIPBOARD_CAP_FILES | LI_CLIPBOARD_CAP_FILE_STREAMS)) {
+      if (supports_blobs) {
+        ++state.blob_sessions;
+      }
+      if (supports_files) {
         ++state.file_sessions;
       }
     }
 
     void unregister_clipboard_origin(std::uint64_t origin_id, std::uint8_t capabilities) {
-      if (origin_id == 0 || (capabilities & LI_CLIPBOARD_CAP_BLOB) == 0) {
+      const bool supports_blobs =
+        (capabilities & LI_CLIPBOARD_CAP_BLOB) != 0;
+      const bool supports_files =
+        (capabilities &
+         (LI_CLIPBOARD_CAP_FILES | LI_CLIPBOARD_CAP_FILE_STREAMS)) ==
+          (LI_CLIPBOARD_CAP_FILES | LI_CLIPBOARD_CAP_FILE_STREAMS);
+      if (origin_id == 0 || (!supports_blobs && !supports_files)) {
         return;
       }
       bool release_files = false;
@@ -135,17 +147,16 @@ namespace stream {
         auto position = clipboard_active_origins.find(origin_id);
         if (position != clipboard_active_origins.end()) {
           auto &state = position->second;
-          if ((capabilities &
-               (LI_CLIPBOARD_CAP_FILES | LI_CLIPBOARD_CAP_FILE_STREAMS)) ==
-                (LI_CLIPBOARD_CAP_FILES | LI_CLIPBOARD_CAP_FILE_STREAMS) &&
+          if (supports_files &&
               state.file_sessions != 0 &&
               --state.file_sessions == 0) {
             release_files = true;
           }
-          if (state.blob_sessions != 0) {
+          if (supports_blobs && state.blob_sessions != 0) {
             --state.blob_sessions;
           }
-          if (state.blob_sessions == 0) {
+          if (state.blob_sessions == 0 &&
+              state.file_sessions == 0) {
             clipboard_active_origins.erase(position);
           }
         }
@@ -1171,12 +1182,15 @@ namespace stream {
 
       auto stored = clipboard_file_store::register_local_offer(
         content.paths,
-        content.origin_id,
+        session->control.clipboard_client_origin_id,
         std::to_string(content.origin_id) + ':' + std::to_string(content.item_id)
       );
       if (!stored.ok ||
           stored.id.empty() ||
           stored.id.size() > LI_CLIPBOARD_FILE_OFFER_ID_MAX_BYTES) {
+        BOOST_LOG(warning)
+          << "Failed to register clipboard file offer for client: "
+          << (stored.error.empty() ? "invalid_offer_id" : stored.error);
         return -1;
       }
 

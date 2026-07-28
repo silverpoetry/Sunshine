@@ -30,7 +30,6 @@ namespace clipboard_file_store {
     bool ok {};
     std::vector<std::uint8_t> bytes;
     digest_t sha256 {};
-    std::uint64_t origin_id {};
     std::string error;
   };
 
@@ -56,26 +55,26 @@ namespace clipboard_file_store {
     std::string error;
   };
 
-  reference_result_t register_local_offer(const std::vector<std::filesystem::path> &paths, std::uint64_t origin_id, std::string idempotency_key);
+  reference_result_t register_local_offer(const std::vector<std::filesystem::path> &paths, std::uint64_t authorized_origin_id, std::string idempotency_key);
 
-  reference_result_t register_remote_offer(std::uint64_t origin_id, std::string idempotency_key);
+  reference_result_t register_remote_offer(std::uint64_t authorized_origin_id, std::string idempotency_key);
 
-  operation_result_t resolve_remote_offer(const std::string &id, std::uint64_t origin_id);
+  operation_result_t resolve_remote_offer(const std::string &id, std::uint64_t authorized_origin_id);
 
-  request_result_t poll_remote_request(const std::string &id, std::uint64_t origin_id, int timeout_seconds = poll_timeout_seconds);
+  request_result_t poll_remote_request(const std::string &id, std::uint64_t authorized_origin_id, int timeout_seconds = poll_timeout_seconds);
 
-  operation_result_t fulfill_remote_request(const std::string &id, std::uint64_t origin_id, const std::string &request_id, const std::vector<std::uint8_t> &bytes, const digest_t &expected_sha256);
+  operation_result_t fulfill_remote_request(const std::string &id, std::uint64_t authorized_origin_id, const std::string &request_id, const std::vector<std::uint8_t> &bytes, const digest_t &expected_sha256);
 
-  operation_result_t fail_remote_request(const std::string &id, std::uint64_t origin_id, const std::string &request_id, std::string error);
+  operation_result_t fail_remote_request(const std::string &id, std::uint64_t authorized_origin_id, const std::string &request_id, std::string error);
 
-  operation_result_t release_remote_source(const std::string &id, std::uint64_t origin_id);
+  operation_result_t release_remote_source(const std::string &id, std::uint64_t authorized_origin_id);
 
-  manifest_result_t get_manifest(const std::string &id, std::uint64_t origin_id);
+  manifest_result_t get_manifest(const std::string &id, std::uint64_t authorized_origin_id);
 
-  chunk_result_t read_chunk(const std::string &id, std::uint64_t origin_id, std::uint32_t file_index, std::uint64_t offset, std::size_t length);
+  chunk_result_t read_chunk(const std::string &id, std::uint64_t authorized_origin_id, std::uint32_t file_index, std::uint64_t offset, std::size_t length);
 
   void sweep_expired();
-  void release_origin(std::uint64_t origin_id);
+  void release_origin(std::uint64_t authorized_origin_id);
   void release_all_remote_sources();
 
 #ifdef SUNSHINE_TESTS
