@@ -69,6 +69,8 @@ namespace clipboard_file_store {
 
   operation_result_t fail_remote_request(const std::string &id, std::uint64_t origin_id, const std::string &request_id, std::string error);
 
+  operation_result_t release_remote_source(const std::string &id, std::uint64_t origin_id);
+
   chunk_result_t request_remote_chunk(const std::string &id, std::uint64_t origin_id, std::uint32_t file_index, std::uint64_t offset, std::size_t length);
 
   manifest_result_t get_manifest(const std::string &id);
@@ -77,6 +79,7 @@ namespace clipboard_file_store {
 
   void sweep_expired();
   void release_origin(std::uint64_t origin_id);
+  void release_all_remote_sources();
 
 #ifdef SUNSHINE_TESTS
   void clear_for_tests();

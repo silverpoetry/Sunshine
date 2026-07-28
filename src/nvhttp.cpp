@@ -37,6 +37,7 @@
 #include "rtsp.h"
 #include "stream.h"
 #include "system_tray.h"
+#include "thread_pool.h"
 #include "utility.h"
 #include "uuid.h"
 #include "video.h"
@@ -1345,6 +1346,11 @@ namespace nvhttp {
         write_clipboard_json(response, SimpleWeb::StatusCode::client_error_bad_request, std::format(R"({{"error":"{}"}})", result.error));
         return;
       }
+      BOOST_LOG(debug)
+        << "Clipboard file trace transfer="
+        << result.id
+        << " phase=registered manifest_bytes="
+        << result.manifest_size;
       write_clipboard_json(response, SimpleWeb::StatusCode::success_ok, std::format(R"({{"id":"{}","size":{},"sha256":"{}","expires_in":{}}})", result.id, result.manifest_size, digest_hex(result.manifest_sha256), clipboard_file_store::source_ttl_seconds));
     }
 
@@ -1403,7 +1409,11 @@ namespace nvhttp {
       );
     }
 
-    void poll_clipboard_file_request(resp_https_t response, req_https_t request) {
+    void poll_clipboard_file_request(
+      resp_https_t response,
+      req_https_t request,
+      thread_pool_util::ThreadPool &poll_workers
+    ) {
       std::uint64_t origin_id {};
       if (!validate_clipboard_origin(request, origin_id, true)) {
         write_clipboard_json(response, SimpleWeb::StatusCode::client_error_forbidden, R"({"error":"inactive_clipboard_session"})");
@@ -1421,29 +1431,102 @@ namespace nvhttp {
         return;
       }
 
-      auto result = clipboard_file_store::poll_remote_request(
-        request->path_match[1].str(),
-        origin_id,
-        static_cast<int>(wait_seconds)
+      const auto transfer_id = request->path_match[1].str();
+      poll_workers.push(
+        [
+          response = std::move(response),
+          transfer_id,
+          origin_id,
+          wait_seconds
+        ]() {
+          auto result = clipboard_file_store::poll_remote_request(
+            transfer_id,
+            origin_id,
+            static_cast<int>(wait_seconds)
+          );
+          if (!result.error.empty()) {
+            write_clipboard_json(
+              response,
+              result.error == "not_found" ?
+                SimpleWeb::StatusCode::client_error_not_found :
+                SimpleWeb::StatusCode::client_error_bad_request,
+              std::format(R"({{"error":"{}"}})", result.error)
+            );
+            return;
+          }
+          if (!result.found) {
+            write_clipboard_json(
+              response,
+              SimpleWeb::StatusCode::success_ok,
+              R"({"request":null})"
+            );
+            return;
+          }
+          write_clipboard_json(
+            response,
+            SimpleWeb::StatusCode::success_ok,
+            std::format(
+              R"({{"request":{{"id":"{}","file_index":{},"offset":{},"length":{}}}}})",
+              result.request_id,
+              result.file_index,
+              result.offset,
+              result.length
+            )
+          );
+        }
       );
-      if (!result.error.empty()) {
-        write_clipboard_json(response, result.error == "not_found" ? SimpleWeb::StatusCode::client_error_not_found : SimpleWeb::StatusCode::client_error_bad_request, std::format(R"({{"error":"{}"}})", result.error));
+    }
+
+    void release_clipboard_file_source(resp_https_t response, req_https_t request) {
+      std::uint64_t origin_id {};
+      if (!validate_clipboard_origin(request, origin_id, true)) {
+        write_clipboard_json(
+          response,
+          SimpleWeb::StatusCode::client_error_forbidden,
+          R"({"error":"inactive_clipboard_session"})"
+        );
         return;
       }
-      if (!result.found) {
-        write_clipboard_json(response, SimpleWeb::StatusCode::success_ok, R"({"request":null})");
+      if (request->path_match.size() < 2) {
+        write_clipboard_json(
+          response,
+          SimpleWeb::StatusCode::client_error_bad_request,
+          R"({"error":"invalid_release_request"})"
+        );
         return;
       }
+      if (request->content.size() != 0) {
+        write_clipboard_json(
+          response,
+          SimpleWeb::StatusCode::client_error_bad_request,
+          R"({"error":"invalid_release_request"})"
+        );
+        return;
+      }
+
+      const auto transfer_id = request->path_match[1].str();
+      auto result = clipboard_file_store::release_remote_source(
+        transfer_id,
+        origin_id
+      );
+      if (!result.ok) {
+        write_clipboard_json(
+          response,
+          result.error == "not_found" ?
+            SimpleWeb::StatusCode::client_error_not_found :
+            SimpleWeb::StatusCode::client_error_bad_request,
+          std::format(R"({{"error":"{}"}})", result.error)
+        );
+        return;
+      }
+      BOOST_LOG(debug)
+        << "Clipboard file trace transfer="
+        << transfer_id
+        << " phase=released";
       write_clipboard_json(
         response,
         SimpleWeb::StatusCode::success_ok,
-        std::format(
-          R"({{"request":{{"id":"{}","file_index":{},"offset":{},"length":{}}}}})",
-          result.request_id,
-          result.file_index,
-          result.offset,
-          result.length
-        )
+        R"({"ok":true})"
       );
     }
 
@@ -1760,6 +1843,10 @@ namespace nvhttp {
 
     https_server_t https_server {config::nvhttp.cert, config::nvhttp.pkey};
     http_server_t http_server;
+    // Clipboard request polls intentionally wait for a host-side file read.
+    // Keep them off the HTTPS I/O context so they cannot block registration,
+    // pairing, or other management requests.
+    thread_pool_util::ThreadPool clipboard_poll_workers {4};
 
     // Verify certificates after establishing connection
     https_server.verify = [add_cert](SSL *ssl) {
@@ -1848,8 +1935,16 @@ namespace nvhttp {
     https_server.resource["^/api/v2/clipboard/blobs/([0-9a-f\\-]{36})$"]["GET"] = download_clipboard_blob;
     https_server.resource["^/api/v2/clipboard/files$"]["POST"] = register_clipboard_file_source;
     https_server.resource["^/api/v2/clipboard/files/pull$"]["POST"] = pull_clipboard_file_source;
-    https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/requests$"]["GET"] = poll_clipboard_file_request;
+    https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/requests$"]["GET"] =
+      [&clipboard_poll_workers](auto response, auto request) {
+        poll_clipboard_file_request(
+          std::move(response),
+          std::move(request),
+          clipboard_poll_workers
+        );
+      };
     https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/requests/([0-9a-f\\-]{36})$"]["POST"] = fulfill_clipboard_file_request;
+    https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/release$"]["POST"] = release_clipboard_file_source;
     https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/manifest$"]["GET"] = download_clipboard_file_manifest;
     https_server.resource["^/api/v2/clipboard/files/([0-9a-f\\-]{36})/([0-9]+)$"]["GET"] = download_clipboard_file_chunk;
     https_server.resource["^/api/files/desktop$"]["POST"] = begin_desktop_file_transfer;
@@ -1894,9 +1989,12 @@ namespace nvhttp {
 
     https_server.stop();
     http_server.stop();
+    clipboard_file_store::release_all_remote_sources();
+    clipboard_poll_workers.stop();
 
     ssl.join();
     tcp.join();
+    clipboard_poll_workers.join();
   }
 
   void erase_all_clients() {

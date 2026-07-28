@@ -10,6 +10,13 @@ extern "C" {
 #include "src/utility.h"
 #include "src/uuid.h"
 
+#ifdef _WIN32
+  #include <windows.h>
+  #ifdef uuid_t
+    #undef uuid_t
+  #endif
+#endif
+
 namespace {
   namespace fs = std::filesystem;
 
@@ -108,9 +115,18 @@ namespace {
 
 TEST_F(DesktopFileStoreTest, CommitsCompleteTransferWithCollisionSafeName) {
   fs::create_directories(desktop / "folder");
+  const auto legacy_staging = desktop / ".moonlight-transfers";
+  fs::create_directory(legacy_staging);
+#ifdef _WIN32
+  ASSERT_TRUE(SetFileAttributesW(
+    legacy_staging.c_str(),
+    FILE_ATTRIBUTE_HIDDEN
+  ));
+#endif
   auto manifest = make_manifest();
   auto transfer = desktop_file_store::begin(manifest, token, "request");
   ASSERT_TRUE(transfer.ok) << transfer.error;
+  EXPECT_FALSE(fs::exists(legacy_staging));
 
   auto retry = desktop_file_store::begin(manifest, token, "request");
   ASSERT_TRUE(retry.ok) << retry.error;
@@ -155,6 +171,7 @@ TEST_F(DesktopFileStoreTest, CommitsCompleteTransferWithCollisionSafeName) {
     std::string(std::istreambuf_iterator<char>(input), {}),
     "hello"
   );
+  EXPECT_FALSE(fs::exists(desktop / ".moonlight-transfers"));
 }
 
 TEST_F(DesktopFileStoreTest, RejectsIncompleteAndOutOfOrderData) {

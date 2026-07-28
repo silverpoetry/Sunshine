@@ -55,6 +55,7 @@ namespace desktop_file_store {
       std::vector<file_t> files;
       std::vector<std::size_t> top_level_indices;
       fs::path desktop;
+      fs::path staging_base;
       fs::path staging_root;
       std::uint64_t total_file_bytes {};
       bool complete {};
@@ -341,20 +342,81 @@ namespace desktop_file_store {
       );
     }
 
-    fs::path staging_base(const fs::path &desktop) {
-      std::error_code error;
-      fs::path base = desktop / ".moonlight-transfers";
-      fs::create_directories(base, error);
-      if (error) {
+    fs::path staging_directory(
+      const interactive_user_context_t &user_context
+    ) {
+#ifdef SUNSHINE_TESTS
+      if (test_desktop) {
+        std::error_code error;
+        const auto path = *test_desktop / ".sunshine-transfer-staging";
+        fs::create_directories(path, error);
+        return error ? fs::path {} : path;
+      }
+#endif
+#ifdef _WIN32
+      PWSTR raw_path = nullptr;
+      const HRESULT result = SHGetKnownFolderPath(
+        FOLDERID_LocalAppData,
+        KF_FLAG_CREATE,
+        user_context.known_folder_token(),
+        &raw_path
+      );
+      if (FAILED(result) || raw_path == nullptr) {
+        if (raw_path != nullptr) {
+          CoTaskMemFree(raw_path);
+        }
         return {};
+      }
+      fs::path base = fs::path(raw_path) / "Sunshine" / "transfers";
+      CoTaskMemFree(raw_path);
+#else
+      fs::path base;
+#endif
+      std::error_code error;
+      fs::create_directories(base, error);
+      return error ? fs::path {} : base;
+    }
+
+    void remove_legacy_desktop_staging(const fs::path &desktop) {
+      const auto base = desktop / ".moonlight-transfers";
+      std::error_code error;
+      fs::directory_iterator iterator(
+        base,
+        fs::directory_options::skip_permission_denied,
+        error
+      );
+      const fs::directory_iterator end;
+      while (!error && iterator != end) {
+        const auto path = iterator->path();
+        const auto id = path.filename().string();
+        std::error_code item_error;
+        const bool owned_transfer =
+          canonical_id(id) &&
+          iterator->is_directory(item_error) &&
+          !item_error &&
+          fs::exists(path / ".sunshine-transfer", item_error) &&
+          !item_error;
+        if (owned_transfer) {
+          fs::remove_all(path, item_error);
+        }
+        iterator.increment(error);
+      }
+      error.clear();
+      if (!fs::is_empty(base, error) || error) {
+        return;
       }
 #ifdef _WIN32
       const DWORD attributes = GetFileAttributesW(base.c_str());
-      if (attributes != INVALID_FILE_ATTRIBUTES) {
-        SetFileAttributesW(base.c_str(), attributes | FILE_ATTRIBUTE_HIDDEN);
+      if (attributes != INVALID_FILE_ATTRIBUTES &&
+          (attributes & FILE_ATTRIBUTE_HIDDEN) != 0) {
+        SetFileAttributesW(
+          base.c_str(),
+          attributes & ~FILE_ATTRIBUTE_HIDDEN
+        );
       }
 #endif
-      return base;
+      error.clear();
+      fs::remove(base, error);
     }
 
     bool decode_manifest(const std::vector<std::uint8_t> &manifest, const fs::path &staging_root, std::vector<file_t> &files, std::vector<std::size_t> &top_level_indices, std::uint64_t &total_file_bytes, std::string &error) {
@@ -407,9 +469,8 @@ namespace desktop_file_store {
 
     void remove_staging(
       const fs::path &path,
-      const fs::path &desktop
+      const fs::path &base
     ) {
-      const auto base = desktop.empty() ? fs::path {} : staging_base(desktop);
       if (path.empty() || base.empty() || path.parent_path() != base ||
           !canonical_id(path.filename().string())) {
         return;
@@ -428,11 +489,11 @@ namespace desktop_file_store {
         position->second.idempotency_key
       ));
       const auto staging_root = position->second.staging_root;
-      const auto desktop = position->second.desktop;
+      const auto staging_base = position->second.staging_base;
       const bool complete = position->second.complete;
       entries.erase(position);
       if (!complete) {
-        remove_staging(staging_root, desktop);
+        remove_staging(staging_root, staging_base);
       }
     }
 
@@ -568,10 +629,11 @@ namespace desktop_file_store {
       }
 
       const auto desktop = desktop_directory(user_context);
-      const auto base = desktop.empty() ? fs::path {} : staging_base(desktop);
-      if (base.empty()) {
+      const auto base = staging_directory(user_context);
+      if (desktop.empty() || base.empty()) {
         return {.error = "desktop_unavailable"};
       }
+      remove_legacy_desktop_staging(desktop);
       remove_stale_staging_locked(base);
 
       const auto id = unique_id_locked();
@@ -626,7 +688,7 @@ namespace desktop_file_store {
         );
         marker << "Sunshine desktop file transfer\n";
         if (!marker) {
-          remove_staging(staging_root, desktop);
+          remove_staging(staging_root, base);
           return {.error = "staging_marker_failed"};
         }
       }
@@ -647,7 +709,7 @@ namespace desktop_file_store {
           }
         }
         if (fs_error) {
-          remove_staging(staging_root, desktop);
+          remove_staging(staging_root, base);
           return {.error = fs_error.message()};
         }
       }
@@ -661,6 +723,7 @@ namespace desktop_file_store {
         .files = std::move(files),
         .top_level_indices = std::move(top_level_indices),
         .desktop = desktop,
+        .staging_base = base,
         .staging_root = staging_root,
         .total_file_bytes = total_file_bytes,
         .complete = false,
@@ -881,7 +944,7 @@ namespace desktop_file_store {
     for (const auto &[id, entry] : entries) {
       (void) id;
       if (!entry.complete) {
-        remove_staging(entry.staging_root, entry.desktop);
+        remove_staging(entry.staging_root, entry.staging_base);
       }
     }
     entries.clear();

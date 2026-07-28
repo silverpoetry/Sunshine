@@ -1,7 +1,9 @@
 #include "clipboard_virtual_files.h"
 
-#include "../../clipboard_file_store.h"
-#include "clipboard_user_helper.h"
+#ifndef SUNSHINE_CLIPBOARD_HELPER
+  #include "../../clipboard_file_store.h"
+  #include "clipboard_user_helper.h"
+#endif
 #include "src/utility.h"
 #include "utf_utils.h"
 
@@ -232,9 +234,24 @@ namespace platf::windows {
             std::min<std::uint64_t>({
               requested - total_read,
               size_ - position_,
-              clipboard_file_store::max_chunk_bytes,
+              LI_CLIPBOARD_MAX_FILE_CHUNK_BYTES,
             })
           );
+#ifdef SUNSHINE_CLIPBOARD_HELPER
+          std::vector<std::uint8_t> bytes;
+          if (!request_virtual_file_chunk_from_service(
+                file_index_,
+                position_,
+                length,
+                bytes
+              ) ||
+              bytes.size() != length) {
+            if (bytes_read) {
+              *bytes_read = total_read;
+            }
+            return STG_E_READFAULT;
+          }
+#else
           auto result = clipboard_file_store::request_remote_chunk(
             transfer_id_,
             origin_id_,
@@ -248,9 +265,11 @@ namespace platf::windows {
             }
             return STG_E_READFAULT;
           }
-          std::memcpy(output + total_read, result.bytes.data(), result.bytes.size());
-          position_ += result.bytes.size();
-          total_read += static_cast<ULONG>(result.bytes.size());
+          auto &bytes = result.bytes;
+#endif
+          std::memcpy(output + total_read, bytes.data(), bytes.size());
+          position_ += bytes.size();
+          total_read += static_cast<ULONG>(bytes.size());
         }
 
         if (bytes_read) {
@@ -315,7 +334,10 @@ namespace platf::windows {
         }
 
         std::vector<std::uint8_t> buffer(
-          std::min<std::uint64_t>(clipboard_file_store::max_chunk_bytes, 1024 * 1024)
+          std::min<std::uint64_t>(
+            LI_CLIPBOARD_MAX_FILE_CHUNK_BYTES,
+            1024 * 1024
+          )
         );
         std::uint64_t remaining = count.QuadPart;
         while (remaining != 0) {
@@ -930,13 +952,27 @@ namespace platf::windows {
 
   bool get_file_clipboard_paths(std::vector<std::filesystem::path> &paths) {
     paths.clear();
+#ifndef SUNSHINE_CLIPBOARD_HELPER
     if (get_user_file_clipboard_paths(paths)) {
       return true;
     }
+#endif
     return clipboard_broker().get_file_paths(paths);
   }
 
   bool set_virtual_file_clipboard(const std::vector<std::uint8_t> &manifest, const std::string &transfer_id, std::uint64_t origin_id, std::uint64_t item_id) {
+#ifndef SUNSHINE_CLIPBOARD_HELPER
+    const auto user_result = set_user_virtual_file_clipboard(
+      manifest,
+      transfer_id,
+      origin_id,
+      item_id
+    );
+    if (user_result != user_virtual_clipboard_result::not_required) {
+      return user_result == user_virtual_clipboard_result::success;
+    }
+#endif
+
     std::vector<file_entry_t> files;
     if (transfer_id.empty() ||
         origin_id == 0 ||

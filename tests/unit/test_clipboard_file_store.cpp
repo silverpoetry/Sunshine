@@ -237,3 +237,53 @@ TEST_F(ClipboardFileStoreTest, RejectsWrongOriginAndUnsolicitedResponses) {
   )
                  .ok);
 }
+
+TEST_F(ClipboardFileStoreTest, ReleasingRemoteSourceWakesLongPoll) {
+  auto source = clipboard_file_store::register_sources(
+    {source_root / "folder"},
+    41,
+    "source"
+  );
+  ASSERT_TRUE(source.ok) << source.error;
+  auto manifest = clipboard_file_store::get_manifest(source.id);
+  ASSERT_TRUE(manifest.found);
+  auto remote = clipboard_file_store::register_remote_source(
+    manifest.bytes,
+    42,
+    "remote"
+  );
+  ASSERT_TRUE(remote.ok) << remote.error;
+
+  auto poll = std::async(std::launch::async, [&]() {
+    return clipboard_file_store::poll_remote_request(
+      remote.id,
+      42,
+      clipboard_file_store::poll_timeout_seconds
+    );
+  });
+
+  EXPECT_FALSE(clipboard_file_store::release_remote_source(
+                 remote.id,
+                 99
+  )
+                 .ok);
+  auto released = clipboard_file_store::release_remote_source(
+    remote.id,
+    42
+  );
+  ASSERT_TRUE(released.ok) << released.error;
+  ASSERT_EQ(
+    poll.wait_for(std::chrono::seconds(1)),
+    std::future_status::ready
+  );
+  auto result = poll.get();
+  EXPECT_FALSE(result.found);
+  EXPECT_EQ(result.error, "not_found");
+
+  // Release is idempotent so cancellation retries are harmless.
+  EXPECT_TRUE(clipboard_file_store::release_remote_source(
+                remote.id,
+                42
+  )
+                .ok);
+}

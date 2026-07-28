@@ -801,6 +801,25 @@ namespace clipboard_file_store {
     return {.ok = true};
   }
 
+  operation_result_t release_remote_source(const std::string &id, std::uint64_t origin_id) {
+    if (id.empty() || origin_id == 0) {
+      return {.error = "invalid_identity"};
+    }
+
+    std::lock_guard lock(store_mutex);
+    auto position = entries.find(id);
+    if (position == entries.end()) {
+      // Releasing a source is intentionally idempotent.
+      return {.ok = true};
+    }
+    if (!position->second.remote_source ||
+        position->second.origin_id != origin_id) {
+      return {.error = "not_found"};
+    }
+    erase_entry_locked(id);
+    return {.ok = true};
+  }
+
   chunk_result_t request_remote_chunk(const std::string &id, std::uint64_t origin_id, std::uint32_t file_index, std::uint64_t offset, std::size_t length) {
     if (length == 0 || length > max_chunk_bytes) {
       return {.error = "bad_chunk_size"};
@@ -923,6 +942,19 @@ namespace clipboard_file_store {
     std::lock_guard lock(store_mutex);
     for (auto position = entries.begin(); position != entries.end();) {
       if (position->second.origin_id != origin_id) {
+        ++position;
+        continue;
+      }
+      const auto id = position->first;
+      ++position;
+      erase_entry_locked(id);
+    }
+  }
+
+  void release_all_remote_sources() {
+    std::lock_guard lock(store_mutex);
+    for (auto position = entries.begin(); position != entries.end();) {
+      if (!position->second.remote_source) {
         ++position;
         continue;
       }

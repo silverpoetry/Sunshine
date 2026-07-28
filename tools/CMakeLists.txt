@@ -58,7 +58,15 @@ target_link_libraries(sunshine-wgc-helper
         ${PLATFORM_LIBRARIES})
 target_compile_options(sunshine-wgc-helper PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
-add_executable(sunshine-clipboard-helper clipboard_helper.cpp)
+add_executable(sunshine-clipboard-helper
+        clipboard_helper.cpp
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/clipboard_virtual_files.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.cpp"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Clipboard.c")
+target_compile_definitions(sunshine-clipboard-helper
+        PRIVATE SUNSHINE_CLIPBOARD_HELPER)
+target_include_directories(sunshine-clipboard-helper
+        PRIVATE "${CMAKE_SOURCE_DIR}/third-party")
 target_link_libraries(sunshine-clipboard-helper
         ${CMAKE_THREAD_LIBS_INIT}
         ole32
