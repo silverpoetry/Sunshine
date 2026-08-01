@@ -376,6 +376,96 @@ TEST_F(ClipboardFileStoreTest, RejectsWrongOriginAndUnsolicitedResponses) {
   ).ok);
 }
 
+TEST_F(ClipboardFileStoreTest, AppliesBackpressureToPendingChunkRequests) {
+  constexpr std::uint64_t origin = 72;
+  auto local = clipboard_file_store::register_local_offer(
+    {source_root / "folder"},
+    origin,
+    "backpressure-local"
+  );
+  ASSERT_TRUE(local.ok) << local.error;
+  auto local_manifest = clipboard_file_store::get_manifest(local.id, origin);
+  ASSERT_TRUE(local_manifest.ok) << local_manifest.error;
+  const auto file = first_regular_file(local_manifest.bytes);
+  ASSERT_NE(file.index, UINT32_MAX);
+
+  auto remote = clipboard_file_store::register_remote_offer(
+    origin,
+    "backpressure-remote"
+  );
+  ASSERT_TRUE(remote.ok) << remote.error;
+  auto pending_manifest = std::async(std::launch::async, [&]() {
+    return clipboard_file_store::get_manifest(remote.id, origin);
+  });
+  auto manifest_request = clipboard_file_store::poll_remote_request(
+    remote.id,
+    origin,
+    1
+  );
+  ASSERT_TRUE(manifest_request.found) << manifest_request.error;
+  ASSERT_TRUE(clipboard_file_store::fulfill_remote_request(
+    remote.id,
+    origin,
+    manifest_request.request_id,
+    local_manifest.bytes,
+    local_manifest.sha256
+  ).ok);
+  ASSERT_TRUE(pending_manifest.get().ok);
+
+  std::vector<std::future<clipboard_file_store::chunk_result_t>> pending;
+  pending.reserve(
+    clipboard_file_store::max_pending_requests_per_source
+  );
+  for (std::size_t index = 0;
+       index < clipboard_file_store::max_pending_requests_per_source;
+       ++index) {
+    pending.push_back(std::async(std::launch::async, [&]() {
+      return clipboard_file_store::read_chunk(
+        remote.id,
+        origin,
+        file.index,
+        0,
+        static_cast<std::size_t>(file.size)
+      );
+    }));
+    auto request = clipboard_file_store::poll_remote_request(
+      remote.id,
+      origin,
+      1
+    );
+    ASSERT_TRUE(request.found) << request.error;
+  }
+
+  auto overflow = std::async(std::launch::async, [&]() {
+    return clipboard_file_store::read_chunk(
+      remote.id,
+      origin,
+      file.index,
+      0,
+      static_cast<std::size_t>(file.size)
+    );
+  });
+  ASSERT_EQ(
+    overflow.wait_for(std::chrono::seconds(1)),
+    std::future_status::ready
+  );
+  auto overflow_result = overflow.get();
+  EXPECT_FALSE(overflow_result.ok);
+  EXPECT_EQ(overflow_result.error, "backpressure");
+
+  ASSERT_TRUE(clipboard_file_store::release_remote_source(
+    remote.id,
+    origin
+  ).ok);
+  for (auto &request : pending) {
+    ASSERT_EQ(
+      request.wait_for(std::chrono::seconds(1)),
+      std::future_status::ready
+    );
+    EXPECT_FALSE(request.get().ok);
+  }
+}
+
 TEST_F(ClipboardFileStoreTest, ReleasingRemoteOfferWakesLongPoll) {
   auto remote = clipboard_file_store::register_remote_offer(42, "remote");
   ASSERT_TRUE(remote.ok) << remote.error;
