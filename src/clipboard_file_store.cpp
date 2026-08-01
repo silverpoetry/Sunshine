@@ -942,49 +942,51 @@ namespace clipboard_file_store {
     return {.ok = true};
   }
 
+  namespace {
+    operation_result_t release_source_impl(
+      const std::string &id,
+      std::uint64_t authorized_origin_id,
+      std::optional<bool> expected_remote_source
+    ) {
+      if (id.empty() || authorized_origin_id == 0) {
+        return {.error = "invalid_identity"};
+      }
+
+      std::lock_guard lock(store_mutex);
+      auto position = entries.find(id);
+      if (position == entries.end()) {
+        // Releasing a source is intentionally idempotent.
+        return {.ok = true};
+      }
+      if (position->second.authorized_origin_id != authorized_origin_id ||
+          (expected_remote_source.has_value() &&
+           position->second.remote_source != *expected_remote_source)) {
+        return {.error = "not_found"};
+      }
+      erase_entry_locked(id);
+      return {.ok = true};
+    }
+  }  // namespace
+
+  operation_result_t release_source(
+    const std::string &id,
+    std::uint64_t authorized_origin_id
+  ) {
+    return release_source_impl(id, authorized_origin_id, std::nullopt);
+  }
+
   operation_result_t release_remote_source(
     const std::string &id,
     std::uint64_t authorized_origin_id
   ) {
-    if (id.empty() || authorized_origin_id == 0) {
-      return {.error = "invalid_identity"};
-    }
-
-    std::lock_guard lock(store_mutex);
-    auto position = entries.find(id);
-    if (position == entries.end()) {
-      // Releasing a source is intentionally idempotent.
-      return {.ok = true};
-    }
-    if (!position->second.remote_source ||
-        position->second.authorized_origin_id !=
-          authorized_origin_id) {
-      return {.error = "not_found"};
-    }
-    erase_entry_locked(id);
-    return {.ok = true};
+    return release_source_impl(id, authorized_origin_id, true);
   }
 
   operation_result_t release_local_source(
     const std::string &id,
     std::uint64_t authorized_origin_id
   ) {
-    if (id.empty() || authorized_origin_id == 0) {
-      return {.error = "invalid_identity"};
-    }
-
-    std::lock_guard lock(store_mutex);
-    auto position = entries.find(id);
-    if (position == entries.end()) {
-      return {.ok = true};
-    }
-    if (position->second.remote_source ||
-        position->second.authorized_origin_id !=
-          authorized_origin_id) {
-      return {.error = "not_found"};
-    }
-    erase_entry_locked(id);
-    return {.ok = true};
+    return release_source_impl(id, authorized_origin_id, false);
   }
 
   static chunk_result_t request_remote_chunk(

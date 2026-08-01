@@ -1501,7 +1501,7 @@ namespace nvhttp {
       }
 
       const auto transfer_id = request->path_match[1].str();
-      auto result = clipboard_file_store::release_remote_source(
+      auto result = clipboard_file_store::release_source(
         transfer_id,
         origin_id
       );

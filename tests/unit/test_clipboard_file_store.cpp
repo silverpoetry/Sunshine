@@ -287,6 +287,39 @@ TEST_F(ClipboardFileStoreTest, BoundsSourcesPerAuthorizedOrigin) {
   ).ok);
 }
 
+TEST_F(ClipboardFileStoreTest, ReleasesEitherSourceDirectionThroughSharedApi) {
+  constexpr std::uint64_t origin = 62;
+  auto local = clipboard_file_store::register_local_offer(
+    {source_root / "folder"},
+    origin,
+    "shared-release-local"
+  );
+  auto remote = clipboard_file_store::register_remote_offer(
+    origin,
+    "shared-release-remote"
+  );
+  ASSERT_TRUE(local.ok) << local.error;
+  ASSERT_TRUE(remote.ok) << remote.error;
+
+  EXPECT_FALSE(clipboard_file_store::release_source(
+    local.id,
+    origin + 1
+  ).ok);
+  ASSERT_TRUE(clipboard_file_store::release_source(
+    local.id,
+    origin
+  ).ok);
+  ASSERT_TRUE(clipboard_file_store::release_source(
+    remote.id,
+    origin
+  ).ok);
+
+  EXPECT_FALSE(clipboard_file_store::get_manifest(local.id, origin).ok);
+  EXPECT_FALSE(clipboard_file_store::resolve_remote_offer(remote.id, origin).ok);
+  EXPECT_TRUE(clipboard_file_store::release_source(local.id, origin).ok);
+  EXPECT_TRUE(clipboard_file_store::release_source(remote.id, origin).ok);
+}
+
 TEST_F(ClipboardFileStoreTest, RejectsWrongOriginAndUnsolicitedResponses) {
   auto remote = clipboard_file_store::register_remote_offer(32, "remote");
   ASSERT_TRUE(remote.ok);

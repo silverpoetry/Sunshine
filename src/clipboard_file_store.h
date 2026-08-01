@@ -70,6 +70,8 @@ namespace clipboard_file_store {
 
   operation_result_t fail_remote_request(const std::string &id, std::uint64_t authorized_origin_id, const std::string &request_id, std::string error);
 
+  operation_result_t release_source(const std::string &id, std::uint64_t authorized_origin_id);
+
   operation_result_t release_remote_source(const std::string &id, std::uint64_t authorized_origin_id);
 
   operation_result_t release_local_source(const std::string &id, std::uint64_t authorized_origin_id);
