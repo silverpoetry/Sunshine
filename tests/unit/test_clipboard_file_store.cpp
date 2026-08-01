@@ -1,5 +1,7 @@
 #include <fstream>
 #include <future>
+#include <stdexcept>
+#include <string_view>
 #include <gtest/gtest.h>
 
 extern "C" {
@@ -7,11 +9,42 @@ extern "C" {
 }
 
 #include "src/clipboard_file_store.h"
+#include "src/crypto.h"
 #include "src/utility.h"
 #include "src/uuid.h"
 
 namespace {
   namespace fs = std::filesystem;
+
+  constexpr char canonical_manifest_hex[] =
+#include "../../third-party/moonlight-common-c/tests/fixtures/ClipboardManifestV1.inc"
+  ;
+
+  std::uint8_t hex_nibble(char value) {
+    if (value >= '0' && value <= '9') {
+      return static_cast<std::uint8_t>(value - '0');
+    }
+    if (value >= 'a' && value <= 'f') {
+      return static_cast<std::uint8_t>(value - 'a' + 10);
+    }
+    throw std::invalid_argument("invalid canonical manifest hex");
+  }
+
+  std::vector<std::uint8_t> canonical_manifest() {
+    const std::string_view encoded {canonical_manifest_hex};
+    if (encoded.size() % 2 != 0) {
+      throw std::invalid_argument("odd canonical manifest hex length");
+    }
+
+    std::vector<std::uint8_t> decoded(encoded.size() / 2);
+    for (std::size_t index = 0; index < decoded.size(); ++index) {
+      decoded[index] = static_cast<std::uint8_t>(
+        (hex_nibble(encoded[index * 2]) << 4) |
+        hex_nibble(encoded[index * 2 + 1])
+      );
+    }
+    return decoded;
+  }
 
   class ClipboardFileStoreTest: public testing::Test {
   protected:
@@ -71,6 +104,56 @@ namespace {
     return {};
   }
 }  // namespace
+
+TEST_F(ClipboardFileStoreTest, PreservesCanonicalManifestThroughRemoteRequest) {
+  constexpr std::uint64_t origin = 9;
+  auto remote = clipboard_file_store::register_remote_offer(
+    origin,
+    "canonical"
+  );
+  ASSERT_TRUE(remote.ok) << remote.error;
+
+  auto pending = std::async(std::launch::async, [&]() {
+    return clipboard_file_store::get_manifest(remote.id, origin);
+  });
+  auto request = clipboard_file_store::poll_remote_request(
+    remote.id,
+    origin,
+    1
+  );
+  ASSERT_TRUE(request.found) << request.error;
+  ASSERT_EQ(
+    request.kind,
+    clipboard_file_store::request_kind_e::manifest
+  );
+
+  const auto manifest = canonical_manifest();
+  ASSERT_TRUE(LiIsValidClipboardFileManifest(
+    manifest.data(),
+    manifest.size()
+  ));
+  const auto digest = crypto::hash(std::string_view {
+    reinterpret_cast<const char *>(manifest.data()),
+    manifest.size()
+  });
+  auto fulfilled = clipboard_file_store::fulfill_remote_request(
+    remote.id,
+    origin,
+    request.request_id,
+    manifest,
+    digest
+  );
+  ASSERT_TRUE(fulfilled.ok) << fulfilled.error;
+  ASSERT_EQ(
+    pending.wait_for(std::chrono::seconds(1)),
+    std::future_status::ready
+  );
+
+  auto received = pending.get();
+  ASSERT_TRUE(received.ok) << received.error;
+  EXPECT_EQ(received.bytes, manifest);
+  EXPECT_EQ(received.sha256, digest);
+}
 
 TEST_F(ClipboardFileStoreTest, RegistersLocalOfferWithoutScanning) {
   const auto missing = source_root / "not-yet-present";
