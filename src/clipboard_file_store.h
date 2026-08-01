@@ -9,6 +9,9 @@
 
 namespace clipboard_file_store {
   constexpr std::size_t max_chunk_bytes = 4ULL * 1024ULL * 1024ULL;
+  constexpr std::size_t max_sources = 128;
+  constexpr std::size_t max_sources_per_origin = 8;
+  constexpr std::size_t max_pending_requests_per_source = 32;
   constexpr int source_ttl_seconds = 24 * 60 * 60;
   constexpr int request_timeout_seconds = 60;
   constexpr int poll_timeout_seconds = 25;
@@ -68,6 +71,8 @@ namespace clipboard_file_store {
   operation_result_t fail_remote_request(const std::string &id, std::uint64_t authorized_origin_id, const std::string &request_id, std::string error);
 
   operation_result_t release_remote_source(const std::string &id, std::uint64_t authorized_origin_id);
+
+  operation_result_t release_local_source(const std::string &id, std::uint64_t authorized_origin_id);
 
   manifest_result_t get_manifest(const std::string &id, std::uint64_t authorized_origin_id);
 

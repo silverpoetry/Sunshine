@@ -1169,6 +1169,29 @@ namespace stream {
     return platf::set_clipboard_content(content);
   }
 
+  void release_local_clipboard_file_offer(
+    const std::vector<std::uint8_t> &wire_data,
+    std::uint8_t wire_mime,
+    std::uint64_t authorized_origin_id
+  ) {
+    if (wire_mime != LI_CLIPBOARD_MIME_FILE_OFFER ||
+        authorized_origin_id == 0) {
+      return;
+    }
+
+    LI_CLIPBOARD_FILE_OFFER offer {};
+    if (LiDecodeClipboardFileOffer(
+          wire_data.data(),
+          wire_data.size(),
+          &offer
+        )) {
+      clipboard_file_store::release_local_source(
+        std::string {offer.id, offer.idLength},
+        authorized_origin_id
+      );
+    }
+  }
+
   int announce_clipboard_content(session_t *session, platf::clipboard_content_t content) {
     if (content.origin_id == 0 ||
         content.item_id == 0 ||
@@ -1255,11 +1278,50 @@ namespace stream {
       wire_mime = LI_CLIPBOARD_MIME_BLOB_REFERENCE;
     }
 
+    const auto previous_origin_id =
+      session->control.clipboard_local_origin_id;
+    const auto previous_item_id =
+      session->control.clipboard_local_item_id;
+    const auto previous_mime =
+      session->control.clipboard_local_mime_type;
+    auto previous_data =
+      std::move(session->control.clipboard_local_data);
+
     session->control.clipboard_local_origin_id = content.origin_id;
     session->control.clipboard_local_item_id = content.item_id;
     session->control.clipboard_local_mime_type = wire_mime;
     session->control.clipboard_local_data = std::move(wire_data);
-    return send_clipboard_control(session, LI_CLIPBOARD_OP_ANNOUNCE, wire_mime, 0, next_clipboard_sequence(session), content.origin_id, content.item_id, static_cast<std::uint32_t>(session->control.clipboard_local_data.size()));
+    const auto result = send_clipboard_control(
+      session,
+      LI_CLIPBOARD_OP_ANNOUNCE,
+      wire_mime,
+      0,
+      next_clipboard_sequence(session),
+      content.origin_id,
+      content.item_id,
+      static_cast<std::uint32_t>(
+        session->control.clipboard_local_data.size()
+      )
+    );
+    if (result != 0) {
+      release_local_clipboard_file_offer(
+        session->control.clipboard_local_data,
+        session->control.clipboard_local_mime_type,
+        session->control.clipboard_client_origin_id
+      );
+      session->control.clipboard_local_origin_id = previous_origin_id;
+      session->control.clipboard_local_item_id = previous_item_id;
+      session->control.clipboard_local_mime_type = previous_mime;
+      session->control.clipboard_local_data = std::move(previous_data);
+      return result;
+    }
+
+    release_local_clipboard_file_offer(
+      previous_data,
+      previous_mime,
+      session->control.clipboard_client_origin_id
+    );
+    return 0;
   }
 
   void handle_clipboard_message(session_t *session, const std::string_view &payload) {

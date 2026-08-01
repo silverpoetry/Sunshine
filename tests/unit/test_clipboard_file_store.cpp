@@ -249,6 +249,44 @@ TEST_F(ClipboardFileStoreTest, ReleasesLocalOfferWithAuthorizedClient) {
   ).ok);
 }
 
+TEST_F(ClipboardFileStoreTest, BoundsSourcesPerAuthorizedOrigin) {
+  constexpr std::uint64_t client_origin = 61;
+  std::vector<std::string> ids;
+  for (std::size_t index = 0;
+       index < clipboard_file_store::max_sources_per_origin;
+       ++index) {
+    auto offer = clipboard_file_store::register_local_offer(
+      {source_root / "folder"},
+      client_origin,
+      "bounded-" + std::to_string(index)
+    );
+    ASSERT_TRUE(offer.ok) << offer.error;
+    ids.push_back(std::move(offer.id));
+  }
+
+  auto overflow = clipboard_file_store::register_local_offer(
+    {source_root / "folder"},
+    client_origin,
+    "bounded-overflow"
+  );
+  EXPECT_FALSE(overflow.ok);
+  EXPECT_EQ(overflow.error, "source_limit");
+
+  EXPECT_FALSE(clipboard_file_store::release_local_source(
+    ids.front(),
+    client_origin + 1
+  ).ok);
+  ASSERT_TRUE(clipboard_file_store::release_local_source(
+    ids.front(),
+    client_origin
+  ).ok);
+  EXPECT_TRUE(clipboard_file_store::register_local_offer(
+    {source_root / "folder"},
+    client_origin,
+    "bounded-after-release"
+  ).ok);
+}
+
 TEST_F(ClipboardFileStoreTest, RejectsWrongOriginAndUnsolicitedResponses) {
   auto remote = clipboard_file_store::register_remote_offer(32, "remote");
   ASSERT_TRUE(remote.ok);

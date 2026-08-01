@@ -484,6 +484,18 @@ namespace clipboard_file_store {
       };
     }
 
+    bool source_limit_reached_locked(std::uint64_t authorized_origin_id) {
+      if (entries.size() >= max_sources) {
+        return true;
+      }
+      return std::count_if(
+               entries.begin(),
+               entries.end(),
+               [authorized_origin_id](const auto &entry) {
+        return entry.second.authorized_origin_id == authorized_origin_id;
+      }) >= static_cast<std::ptrdiff_t>(max_sources_per_origin);
+    }
+
     chunk_result_t read_local_chunk(
       const std::string &id,
       std::uint64_t authorized_origin_id,
@@ -584,6 +596,9 @@ namespace clipboard_file_store {
           return {.error = "not_found"};
         }
         auto &entry = position->second;
+        if (entry.requests.size() >= max_pending_requests_per_source) {
+          return {.error = "backpressure"};
+        }
         if (kind == request_kind_e::chunk) {
           if (file_index >= entry.files.size()) {
             return {.error = "not_found"};
@@ -683,6 +698,9 @@ namespace clipboard_file_store {
       if (existing.ok || !existing.error.empty()) {
         return existing;
       }
+      if (source_limit_reached_locked(authorized_origin_id)) {
+        return {.error = "source_limit"};
+      }
 
       const auto id = unique_id_locked();
       entry_t entry {
@@ -727,6 +745,9 @@ namespace clipboard_file_store {
       );
       if (existing.ok || !existing.error.empty()) {
         return existing;
+      }
+      if (source_limit_reached_locked(authorized_origin_id)) {
+        return {.error = "source_limit"};
       }
 
       const auto id = unique_id_locked();
@@ -936,6 +957,28 @@ namespace clipboard_file_store {
       return {.ok = true};
     }
     if (!position->second.remote_source ||
+        position->second.authorized_origin_id !=
+          authorized_origin_id) {
+      return {.error = "not_found"};
+    }
+    erase_entry_locked(id);
+    return {.ok = true};
+  }
+
+  operation_result_t release_local_source(
+    const std::string &id,
+    std::uint64_t authorized_origin_id
+  ) {
+    if (id.empty() || authorized_origin_id == 0) {
+      return {.error = "invalid_identity"};
+    }
+
+    std::lock_guard lock(store_mutex);
+    auto position = entries.find(id);
+    if (position == entries.end()) {
+      return {.ok = true};
+    }
+    if (position->second.remote_source ||
         position->second.authorized_origin_id !=
           authorized_origin_id) {
       return {.error = "not_found"};
