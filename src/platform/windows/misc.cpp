@@ -108,6 +108,15 @@ namespace platf {
   using adapteraddrs_t = util::c_ptr<IP_ADAPTER_ADDRESSES>;
 
   namespace {
+    // Windows declares LCS_sRGB as the implementation-defined multi-character
+    // literal 'sRGB'. Build the documented signature explicitly so GCC and
+    // Clang agree with MSVC without requiring a warning suppression.
+    constexpr DWORD lcs_srgb_signature =
+      (static_cast<DWORD>('s') << 24) |
+      (static_cast<DWORD>('R') << 16) |
+      (static_cast<DWORD>('G') << 8) |
+      static_cast<DWORD>('B');
+
     std::uint32_t fnv1a32(std::string_view bytes) {
       std::uint32_t hash = 2166136261u;
       for (unsigned char byte : bytes) {
@@ -2085,7 +2094,7 @@ namespace platf {
       header->bV5GreenMask = 0x0000FF00;
       header->bV5BlueMask = 0x000000FF;
       header->bV5AlphaMask = 0xFF000000;
-      header->bV5CSType = LCS_sRGB;
+      header->bV5CSType = lcs_srgb_signature;
       header->bV5Intent = LCS_GM_IMAGES;
 
       return SUCCEEDED(converter->CopyPixels(

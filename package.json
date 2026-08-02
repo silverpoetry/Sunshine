@@ -2,8 +2,8 @@
   "name": "sunshine",
   "version": "0.0.0",
   "scripts": {
-    "build": "vite build --debug",
-    "build-clean": "vite build --debug --emptyOutDir",
+    "build": "vite build",
+    "build-clean": "vite build --emptyOutDir",
     "dev": "vite build --watch",
     "serve": "serve ./tests/fixtures/http --no-port-switching"
   },

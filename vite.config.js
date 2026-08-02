@@ -42,6 +42,22 @@ else {
 
 let header = fs.readFileSync(resolve(assetsSrcPath, "template_header.html"))
 
+const plugins = [
+    vue(),
+    ViteEjsPlugin({ header }),
+]
+
+if (process.env.CODECOV_TOKEN) {
+    // Bundle analysis is a CI publication step. Local release builds must be
+    // deterministic and must not attempt telemetry or unauthenticated uploads.
+    plugins.push(codecovVitePlugin({
+        enableBundleAnalysis: true,
+        bundleName: "sunshine",
+        uploadToken: process.env.CODECOV_TOKEN,
+        gitService: "github",
+    }))
+}
+
 // https://vitejs.dev/config/
 export default defineConfig({
     resolve: {
@@ -50,20 +66,13 @@ export default defineConfig({
         }
     },
     base: './',
-    plugins: [
-        vue(),
-        ViteEjsPlugin({ header }),
-        // The Codecov vite plugin should be after all other plugins
-        codecovVitePlugin({
-            enableBundleAnalysis: true,
-            bundleName: "sunshine",
-            uploadToken: process.env.CODECOV_TOKEN,
-            gitService: "github",
-        }),
-    ],
+    plugins,
     root: resolve(assetsSrcPath),
     build: {
         outDir: resolve(assetsDstPath),
+        // CMake owns the complete assets directory. Vite contributes only the
+        // web subtree and must not remove sibling runtime assets.
+        emptyOutDir: false,
         rollupOptions: {
             input: {
                 apps: resolve(assetsSrcPath, 'apps.html'),

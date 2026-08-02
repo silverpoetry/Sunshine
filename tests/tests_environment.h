@@ -14,6 +14,11 @@ struct SunshineEnvironment: testing::Environment {
   void TearDown() override {
     deinit_log = {};
     mail::man = {};
+
+    std::error_code error;
+    std::filesystem::remove("test_sunshine.log", error);
+    error.clear();
+    std::filesystem::remove("sunshine_state.json", error);
   }
 
   std::unique_ptr<logging::deinit_t> deinit_log;

@@ -13,8 +13,25 @@ include(dependencies/Boost_Sunshine)
 set(ENET_NO_INSTALL ON CACHE BOOL "Don't install any libraries built for enet")
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet")
 
-# web server
-add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/Simple-Web-Server")
+# The pinned upstream head still declares compatibility with CMake 3.1. Keep
+# its deprecation warning scoped to that dependency so Sunshine's own CMake
+# warnings remain visible. CMake reads this diagnostic setting from the cache,
+# so preserve and restore the caller's exact state around add_subdirectory().
+function(add_simple_web_server_dependency)
+    get_property(warn_deprecated_was_set CACHE CMAKE_WARN_DEPRECATED PROPERTY TYPE SET)
+    if(warn_deprecated_was_set)
+        get_property(warn_deprecated_value CACHE CMAKE_WARN_DEPRECATED PROPERTY VALUE)
+    endif()
+    set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "Emit CMake deprecation warnings" FORCE)
+    add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/Simple-Web-Server")
+    if(warn_deprecated_was_set)
+        set(CMAKE_WARN_DEPRECATED "${warn_deprecated_value}" CACHE BOOL
+                "Emit CMake deprecation warnings" FORCE)
+    else()
+        unset(CMAKE_WARN_DEPRECATED CACHE)
+    endif()
+endfunction()
+add_simple_web_server_dependency()
 
 # libdisplaydevice
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/libdisplaydevice")

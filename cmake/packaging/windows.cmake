@@ -73,7 +73,22 @@ file(COPY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/assets/"
 cmake_path(CONVERT "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/assets/shaders"
         TO_NATIVE_PATH_LIST shaders_in_build_src_native)
 cmake_path(CONVERT "${CMAKE_BINARY_DIR}/assets/shaders" TO_NATIVE_PATH_LIST shaders_in_build_dest_native)
-execute_process(COMMAND cmd.exe /c mklink /J "${shaders_in_build_dest_native}" "${shaders_in_build_src_native}")
+if(EXISTS "${CMAKE_BINARY_DIR}/assets/shaders")
+    file(REAL_PATH "${CMAKE_BINARY_DIR}/assets/shaders" shaders_in_build_dest_real)
+    file(REAL_PATH "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/assets/shaders" shaders_in_build_src_real)
+    if(NOT shaders_in_build_dest_real STREQUAL shaders_in_build_src_real)
+        message(FATAL_ERROR
+                "Existing shader path points to '${shaders_in_build_dest_real}', expected '${shaders_in_build_src_real}'")
+    endif()
+else()
+    execute_process(
+            COMMAND cmd.exe /c mklink /J "${shaders_in_build_dest_native}" "${shaders_in_build_src_native}"
+            RESULT_VARIABLE shader_junction_result
+            ERROR_VARIABLE shader_junction_error)
+    if(NOT shader_junction_result EQUAL 0)
+        message(FATAL_ERROR "Unable to create shader junction: ${shader_junction_error}")
+    endif()
+endif()
 
 set(CPACK_PACKAGE_ICON "${CMAKE_SOURCE_DIR}\\\\sunshine.ico")
 

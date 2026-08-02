@@ -78,16 +78,12 @@ Hey, hey, hey!
   )
 );
 
-TEST_P(FileHandlerTests, WriteFileTest) {
+TEST_P(FileHandlerTests, WriteAndReadFileTest) {
   auto [fileNum, content] = GetParam();
   const std::string fileName = std::format("write_file_test_{}.txt", fileNum);
   EXPECT_EQ(file_handler::write_file(fileName.c_str(), content), 0);
-}
-
-TEST_P(FileHandlerTests, ReadFileTest) {
-  auto [fileNum, content] = GetParam();
-  const std::string fileName = std::format("write_file_test_{}.txt", fileNum);
   EXPECT_EQ(file_handler::read_file(fileName.c_str()), content);
+  EXPECT_TRUE(std::filesystem::remove(fileName));
 }
 
 TEST(FileHandlerTests, ReadMissingFileTest) {
